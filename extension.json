@@ -20,13 +20,18 @@
         "deepseek41",
         "deepseek41-gsq-coder"
       ],
-      "target": "gufo_deepseek41",
+      "target": "gufo_deepseek41_hip",
       "entry": "deepseek41_provider_register"
     }
   ],
   "targets": {
     "gufo_deepseek41": {
       "requires": []
+    },
+    "gufo_deepseek41_hip": {
+      "requires": [
+        "hip"
+      ]
     }
   }
 }
