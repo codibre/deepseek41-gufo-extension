@@ -82,9 +82,10 @@ gufo_extension_target(
 )
 
 if(TARGET gufo_deepseek41_hip AND ENGINE_ENABLE_HIP)
-  set_source_files_properties(src/model/kernels/rocm/backend.hip.cpp
-    PROPERTIES LANGUAGE HIP)
-  target_sources(gufo_deepseek41_hip PRIVATE src/model/kernels/rocm/backend.hip.cpp)
+  gufo_extension_hip_sources(gufo_deepseek41_hip
+    SOURCES
+      src/model/kernels/rocm/backend.hip.cpp
+  )
   target_compile_definitions(gufo_deepseek41_hip PRIVATE
     _GNU_SOURCE DS4_ROCM_BUILD=1 ENGINE_ENABLE_HIP=1 GGML_HIP_NO_VMM)
   target_compile_options(gufo_deepseek41_hip PRIVATE
