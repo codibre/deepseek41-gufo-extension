@@ -69,7 +69,7 @@ gufo_extension_target(
     src/model/runtime/sampling.cpp
     src/model/runtime/session.cpp
     src/model/runtime/tokenizer.cpp
-    src/model/core_compat/bandwidth.cpp
+    src/model/core_compat/hip/bandwidth.cpp
     src/model/core_compat/hip/weight_upload.cpp
     src/model/core_compat/hip/hipblaslt_plan_database.cpp
   LINK_LIBRARIES
