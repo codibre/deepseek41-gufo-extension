@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "name": "deepseek41",
+  "version": "0.1.0",
+  "api_version": ">= 0.1.16",
+  "entry": "deepseek41_register",
+  "registration_target": "gufo_deepseek41",
+  "depends": [],
+  "platforms": [
+    "linux"
+  ],
+  "providers": [
+    {
+      "id": "deepseek41-gsq",
+      "capability": "text_generation",
+      "keys": [
+        "gguf:deepseek41"
+      ],
+      "model_ids": [
+        "deepseek41",
+        "deepseek41-gsq-coder"
+      ],
+      "target": "gufo_deepseek41",
+      "entry": "deepseek41_provider_register"
+    }
+  ],
+  "targets": {
+    "gufo_deepseek41": {
+      "requires": []
+    }
+  }
+}

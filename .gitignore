@@ -1,0 +1,4 @@
+build-gufo/
+build/
+__pycache__/
+*.o
