@@ -21,7 +21,7 @@ set(DS41_MMQ_SOURCES
   ${DS41_MMQ_DIR}/mmvq.hip.cpp
   ${DS41_MMQ_DIR}/quantize.hip.cpp)
 
-if(TARGET gufo_deepseek41 AND ENGINE_ENABLE_HIP)
+if(ENGINE_ENABLE_HIP)
   add_library(gufo_deepseek41_mmq STATIC ${DS41_MMQ_SOURCES})
   set_source_files_properties(${DS41_MMQ_SOURCES} PROPERTIES LANGUAGE HIP)
   set_target_properties(gufo_deepseek41_mmq PROPERTIES
