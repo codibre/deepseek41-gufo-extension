@@ -38,10 +38,11 @@ vision; general-purpose use → unpruned release.
   +23), and the Coder sits below base (LCB 88.6) → Flash-Next likely wins
   these head-to-head.
 - Non-code domains: untested for the Coder; card says assume degradation.
-- Cost side (this box): Flash-Next Q4_K_XL 122B runs fully in VRAM (~17
-  tps cold, proven). Coder = 72 GB weights (RAM) + 110.6 GB engram
-  (can stay on SSD per ISTA: 24 rows/token lookups) — speed unknown until
-  the gufo port lands; llama.cpp master is a usable oracle meanwhile.
+- Cost side (this box): unified-memory APU, ~120 GB usable as VRAM.
+  Coder = 72.1 GB weights → fully resident in the pool; KV at 1M ctx is
+  ~1-2 GB; the 110.6 GB engram stays disk-mmap by design (24 short rows
+  per token, served from page cache + NVMe). No CPU-paging cliff — decode
+  speed should be in the same class as the resident Flash-Next slot.
 
 ## Cheap A/B once feasible
 
