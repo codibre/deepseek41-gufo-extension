@@ -70,6 +70,11 @@ gufo_extension_target(
     src/model/runtime/session.cpp
     src/model/runtime/tokenizer.cpp
     src/model/core_compat/hip/bandwidth.cpp
+    src/model/core_compat/hip/committed_backing.cpp
+    src/model/core_compat/hip/component_cache_resources.cpp
+    src/model/core_compat/hip/host_allocations.cpp
+    src/model/core_compat/hip/staging.cpp
+    src/model/core_compat/hip/transfer_pool.cpp
     src/model/core_compat/diagnostics/fingerprint.cpp
     src/model/core_compat/diagnostics/system_inventory.cpp
     src/model/core_compat/diagnostics/linux_sysfs.cpp
@@ -89,6 +94,8 @@ if(TARGET gufo_deepseek41_hip AND ENGINE_ENABLE_HIP)
   gufo_extension_hip_sources(gufo_deepseek41_hip
     SOURCES
       src/model/kernels/rocm/backend.hip.cpp
+      src/model/core_compat/hip/allocation_benchmark.hip
+      src/model/core_compat/hip/snapshot_copy.hip
   )
   target_compile_definitions(gufo_deepseek41_hip PRIVATE
     _GNU_SOURCE DS4_ROCM_BUILD=1 ENGINE_ENABLE_HIP=1 GGML_HIP_NO_VMM)
