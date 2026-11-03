@@ -29,7 +29,11 @@ if(TARGET gufo_deepseek41 AND ENGINE_ENABLE_HIP)
   target_compile_definitions(gufo_deepseek41_mmq PRIVATE
     GGML_USE_HIP GGML_HIP_NO_VMM DS4_ROCM_WMMA_MMQ_Y=64)
   target_compile_options(gufo_deepseek41_mmq PRIVATE
-    $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffast-math;-fno-finite-math-only;-Wno-unused-value;-Wno-unused-command-line-argument>)
+    $<$<COMPILE_LANGUAGE:HIP>:-O3>
+    $<$<COMPILE_LANGUAGE:HIP>:-ffast-math>
+    $<$<COMPILE_LANGUAGE:HIP>:-fno-finite-math-only>
+    $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-value>
+    $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-command-line-argument>)
   target_include_directories(gufo_deepseek41_mmq SYSTEM PUBLIC ${DS41_MMQ_DIR})
   target_link_libraries(gufo_deepseek41_mmq PUBLIC
     gufo_ext_runtime hip::host roc::hipblas)
@@ -84,8 +88,13 @@ if(TARGET gufo_deepseek41_hip AND ENGINE_ENABLE_HIP)
   target_compile_definitions(gufo_deepseek41_hip PRIVATE
     _GNU_SOURCE DS4_ROCM_BUILD=1 ENGINE_ENABLE_HIP=1 GGML_HIP_NO_VMM)
   target_compile_options(gufo_deepseek41_hip PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-O3;-ffast-math;-fno-finite-math-only>
-    $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffast-math;-fno-finite-math-only;-Wno-unused-command-line-argument>)
+    $<$<COMPILE_LANGUAGE:CXX>:-O3>
+    $<$<COMPILE_LANGUAGE:CXX>:-ffast-math>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-finite-math-only>
+    $<$<COMPILE_LANGUAGE:HIP>:-O3>
+    $<$<COMPILE_LANGUAGE:HIP>:-ffast-math>
+    $<$<COMPILE_LANGUAGE:HIP>:-fno-finite-math-only>
+    $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-command-line-argument>)
   target_include_directories(gufo_deepseek41_hip PUBLIC
     "$<BUILD_INTERFACE:${GUFO_EXTENSION_BUILD_ROOT}/src>"
     "$<BUILD_INTERFACE:${GUFO_EXTENSION_BUILD_ROOT}>"
