@@ -519,14 +519,20 @@ std::vector<PromptPiece> SplitControlTokens(
 
 bool ValidateGgufTemplate(const core::GgufReader& reader,
                           std::string* error_msg) {
-  if (reader.GetMetadataString("general.architecture") != "deepseek4") {
+  // The vendored engine was forked for deepseek4; this port's containers
+  // declare the deepseek41 architecture (GSQ coder split layout).
+  const auto arch = reader.GetMetadataString("general.architecture");
+  if (arch != "deepseek4" && arch != "deepseek41") {
     AssignError(error_msg,
                 "DeepSeek V4 Flash artifact has unexpected architecture");
     return false;
   }
   const auto name = reader.GetMetadataString("general.name");
-  if (!name.has_value() ||
-      name->find("DeepSeek V4 Flash") == std::string_view::npos) {
+  const bool named =
+      name.has_value() && (name->find("DeepSeek V4 Flash") != std::string_view::npos ||
+                           name->find("DeepSeek-V4.1-Flash") != std::string_view::npos ||
+                           name->find("DeepSeek V4.1 Flash") != std::string_view::npos);
+  if (!named) {
     AssignError(error_msg,
                 "DeepSeek artifact is not the supported V4 Flash revision");
     return false;
