@@ -63,6 +63,10 @@ gufo_extension_target(
   NAME gufo_deepseek41_hip
   SOURCES
     src/model/engine.cpp
+    src/model/runner.cpp
+    src/model/drivers.cpp
+    src/model/tool_calls.cpp
+    src/model/continuation_identity.cpp
     src/model/provider.cpp
     src/model/runtime/model_data.cpp
     src/model/runtime/rocm_graph.cpp

@@ -378,13 +378,6 @@ std::unique_ptr<Ds41Reader> Ds41Reader::OpenFile(const std::string& path,
     if (parsed.fatal || parsed.truncated) {
       return fail("malformed GGUF header: " + shard_path.string());
     }
-    // V4.1 split containers put all tensors in shards 2..N behind a
-    // metadata-only shard 1 (llama.cpp convention); a single-file GGUF must
-    // still carry its own tensors.
-    if (s == 0 && parsed.tensors.empty() && total_shards == 1) {
-      return fail("no tensors in " + shard_path.string());
-    }
-
     // First shard decides alignment and shard count; KV is first-wins.
     for (auto& [key, value] : parsed.kv) {
       reader->metadata_.emplace(key, std::move(value));
@@ -404,6 +397,15 @@ std::unique_ptr<Ds41Reader> Ds41Reader::OpenFile(const std::string& path,
           total_shards = static_cast<std::uint32_t>(*raw);
         }
       }
+    }
+    // V4.1 split containers put all tensors in shards 2..N behind a
+    // metadata-only shard 1 (this container reports n_tensors=0 +
+    // split.count=6; the llama.cpp upstream convention of carrying every
+    // tensor info in shard 1 is the other legal split shape). A single-file
+    // GGUF must still carry its own tensors. This must run only after
+    // split.count is consumed, or a metadata-only first shard is rejected.
+    if (s == 0 && parsed.tensors.empty() && total_shards == 1) {
+      return fail("no tensors in " + shard_path.string());
     }
     shard.data_start = AlignUp(parsed.header_length, alignment);
 
