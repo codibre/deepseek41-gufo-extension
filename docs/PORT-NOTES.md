@@ -135,3 +135,40 @@ this file the same way. First load warms through disk; keep llama-swap
 
 Vision (`deepseek41_vl_*` keys, `general.file_type=19` mismatch — tensor
 types are authoritative); speculative/MTP draft support; CUDA path.
+
+## Bring-up findings (first llama-swap windows)
+
+The llama-swap test window proved the extension mechanism end to end:
+router evicts the resident model, spawns this binary, `claim_file` claims
+the split container, provider `deepseek41-gsq` resolves, and the vendored
+engine is entered with the artifact. Four bring-up bugs fixed on the way:
+
+1. `Ds41Reader::OpenFile` ran the empty-tensors guard before consuming
+   `split.count`. This container is the OTHER legal split shape:
+   shard 1 is metadata-only (`n_tensors=0`, 77 KV), tensor infos are
+   distributed in shards 2..5 (307/294/277/164) + shard 6 (1 engram
+   tensor, IQ4_NL). Fixed by reordering; total 1043 tensors either way.
+2. The provider registered `claim_file` only; `.create`/`.bench_driver`/
+   `.prompt_driver`/`.chat_driver` now point at the vendored engine.
+3. Root `extension.cmake` hip tier was missing `runner.cpp`,
+   `drivers.cpp`, `tool_calls.cpp`, `continuation_identity.cpp`.
+4. `ValidateGgufTemplate` hard-gated `general.architecture == deepseek4`
+   and a `DeepSeek V4 Flash` name substring; accepts `deepseek41` and
+   `DeepSeek-V4.1-Flash` name variants now.
+
+### The real remaining wall: engine is V4 Flash architecture
+
+`model_data.cpp` enforces a fixed shape (`DS4_N_LAYER=43`, `DS4_N_EMBD=
+4096`, `DS4_N_EXPERT=256`, `DS4_N_FF_EXP=2048`, `DS4_N_LORA_*=1024`,
+`DS4_N_INDEXER_HEAD=64`) through 24 `config_expect_*` gates. The V4.1
+artifact is 40L / 5120 / 192 experts / 2304 FFN / 1280 lora / 32 indexer
+heads, and additionally carries semantics the vendored engine has no
+concept of: `ple.*` (n-gram PLE head tables), `engram.*` (disk-resident
+token table, shard 6), `attention.kv_source_layers`,
+`attention.compress_ratios`, `indexer.candidate_*`. gufo upstream has no
+v4.1 engine either. Porting these is forward-architecture work (graph
+construction in `rocm_graph.cpp` + engram gather kernels + gate
+math `sigmoid(copysign(sqrt(|dot|), dot))`), not glue.
+
+Interim runtime: llama.cpp >= b11870 supports this container natively
+(model card requirement); engram is read disk-mapped, one row per token.
