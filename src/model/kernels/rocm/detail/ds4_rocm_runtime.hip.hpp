@@ -13,6 +13,28 @@ static gufo::platform::PlatformFile g_model_fd =
 static const void *g_model_fd_host_base;
 static int g_model_cache_full;
 static std::unique_ptr<gufo::hip::WeightUpload> g_model_uploader;
+
+/* Split GGUF: when set, model offsets address the flat view built from these
+ * shard regions; uploads resolve the owning shard from the host address. */
+static std::vector<gufo::core::GgufMappedRegion> g_model_shard_regions;
+
+extern "C" int ds4_gpu_set_model_shards(const void *const *data, const uint64_t *sizes,
+                                        const gufo::platform::PlatformFile *fds,
+                                        uint32_t count) {
+    g_model_shard_regions.clear();
+    if (count == 0) return 1;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!data[i] || sizes[i] == 0 || !gufo::platform::FileValid(fds[i])) return 0;
+        g_model_shard_regions.push_back(gufo::core::GgufMappedRegion{
+            .data = data[i],
+            .size = static_cast<size_t>(sizes[i]),
+            .file_descriptor = fds[i],
+        });
+    }
+    g_model_uploader.reset();
+    return 1;
+}
+
 static hipblasHandle_t g_hipblas;
 static int g_hipblas_ready;
 /* Strix Halo detection. The optimized prefill routes below are scored on
@@ -754,6 +776,25 @@ static const char *hip_model_range_ptr_from_fd(
         return NULL;
     }
     std::string error;
+    if (!g_model_shard_regions.empty()) {
+        if (!g_model_uploader) {
+            g_model_uploader = gufo::hip::WeightUpload::Create(
+                g_model_shard_regions, &error);
+        }
+        const void *src = static_cast<const char *>(model_map) + offset;
+        if (!g_model_uploader ||
+            !g_model_uploader->CopyMapped(src, (size_t)bytes, dev, &error) ||
+            (wait && !g_model_uploader->Finish(&error))) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "split model upload failed for %s: %s\n",
+                    what ? what : "weights", error.c_str());
+            return NULL;
+        }
+        g_model_ranges.push_back({model_map, offset, bytes, dev});
+        g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
+        g_model_range_bytes += bytes;
+        hip_model_load_progress_note(g_model_range_bytes);
+        return (const char *)dev;
+    }
     if (!g_model_uploader) {
         const gufo::core::GgufMappedRegion region{
             .data = model_map,
@@ -867,6 +908,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_registered_size = 0;
     g_model_weight_alloc.reset();
     g_model_fd = gufo::platform::kInvalidFile;
+    g_model_shard_regions.clear();
     g_model_cache_full = 0;
 }
 

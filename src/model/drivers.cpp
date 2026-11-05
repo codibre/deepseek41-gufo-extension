@@ -669,8 +669,15 @@ static std::shared_ptr<models::deepseek_v4_flash::Model> LoadDeepSeekModel(
     return nullptr;
   }
   std::string template_error;
-  if (!models::deepseek_v4_flash::ValidateGgufTemplate(reader,
-                                                       &template_error)) {
+  // The API-supplied core reader is the empty view for claimed (split GSQ)
+  // artifacts; validate the template from the file itself in that case.
+  const bool template_ok =
+      (&reader == &core::GgufReader::Empty())
+          ? models::deepseek_v4_flash::ValidateTemplateFromFile(opt.model_path,
+                                                                &template_error)
+          : models::deepseek_v4_flash::ValidateGgufTemplate(reader,
+                                                            &template_error);
+  if (!template_ok) {
     std::cerr << "Unsupported DeepSeek chat template: " << template_error
               << '\n';
     PrintModelLoadTime(load_start, false);

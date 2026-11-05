@@ -109,6 +109,12 @@ struct PromptPiece {
 
 /// Rejects DeepSeek artifacts whose embedded template is not the pinned
 /// converter version implemented by the compiled formatter.
+/// Same validation, sourcing metadata straight from the file with the
+/// extension's own GGUF reader.  Claimed (GSQ split) artifacts reach drivers
+/// with the empty core reader, so template pinning must not depend on it.
+[[nodiscard]] bool ValidateTemplateFromFile(const std::string& path,
+                                            std::string* error_msg);
+
 [[nodiscard]] bool ValidateGgufTemplate(const core::GgufReader& reader,
                                         std::string* error_msg = nullptr);
 
@@ -118,6 +124,11 @@ struct PromptPiece {
 
 [[nodiscard]] constexpr std::string_view ArtifactTemplateSha256() noexcept {
   return "872492071c22c8d2025238120309ffbddddb666b49f4433f55c19b69bf51af27";
+}
+
+/// Pinned chat template of the deepseek41 (V4.1 Flash GSQ) artifact.
+[[nodiscard]] constexpr std::string_view ArtifactTemplateSha256V41() noexcept {
+  return "4d61d22c90ea0cdf15c7e298f7215f23eeffd20f8eed8fb517fda5fb64693d99";
 }
 
 [[nodiscard]] constexpr std::string_view EncoderReferenceSha256() noexcept {

@@ -1,4 +1,5 @@
 #include "model/chat_template.hpp"
+#include "model/gguf/ds41_reader.hpp"
 
 #include <algorithm>
 #include <array>
@@ -517,6 +518,48 @@ std::vector<PromptPiece> SplitControlTokens(
   return pieces;
 }
 
+bool ValidateTemplateFromFile(const std::string& path, std::string* error_msg) {
+  std::string err;
+  const auto reader = gufo::models::deepseek41::gg::Ds41Reader::OpenFile(
+      path, &err, /*map_data=*/false);
+  if (reader == nullptr) {
+    AssignError(error_msg, "cannot re-open model file for template check: " + err);
+    return false;
+  }
+  const auto arch = reader->GetMetadataString("general.architecture");
+  if (arch != "deepseek4" && arch != "deepseek41") {
+    AssignError(error_msg,
+                "DeepSeek V4 Flash artifact has unexpected architecture");
+    return false;
+  }
+  const auto name = reader->GetMetadataString("general.name");
+  const bool named =
+      name.has_value() && (name->find("DeepSeek V4 Flash") != std::string_view::npos ||
+                           name->find("DeepSeek-V4.1-Flash") != std::string_view::npos ||
+                           name->find("DeepSeek V4.1 Flash") != std::string_view::npos);
+  if (!named) {
+    AssignError(error_msg,
+                "DeepSeek artifact is not the supported V4 Flash revision");
+    return false;
+  }
+  const auto raw_template = reader->GetMetadataString("tokenizer.chat_template");
+  if (!raw_template.has_value() || raw_template->empty()) {
+    AssignError(error_msg,
+                "DeepSeek GGUF is missing tokenizer.chat_template metadata");
+    return false;
+  }
+  const std::string actual_hash = Sha256(*raw_template);
+  const bool v41 = arch == "deepseek41";
+  if (actual_hash != (v41 ? ArtifactTemplateSha256V41()
+                          : ArtifactTemplateSha256())) {
+    AssignError(error_msg,
+                std::string("DeepSeek GGUF chat template SHA-256 is not the pinned ") +
+                    (v41 ? "V4.1" : "0731") + " artifact version: " + actual_hash);
+    return false;
+  }
+  return true;
+}
+
 bool ValidateGgufTemplate(const core::GgufReader& reader,
                           std::string* error_msg) {
   // The vendored engine was forked for deepseek4; this port's containers
@@ -544,11 +587,12 @@ bool ValidateGgufTemplate(const core::GgufReader& reader,
     return false;
   }
   const std::string actual_hash = Sha256(*raw_template);
-  if (actual_hash != ArtifactTemplateSha256()) {
+  const bool v41 = arch == "deepseek41";
+  if (actual_hash != (v41 ? ArtifactTemplateSha256V41()
+                          : ArtifactTemplateSha256())) {
     AssignError(error_msg,
-                "DeepSeek GGUF chat template SHA-256 is not the pinned 0731 "
-                "artifact version: " +
-                    actual_hash);
+                std::string("DeepSeek GGUF chat template SHA-256 is not the pinned ") +
+                    (v41 ? "V4.1" : "0731") + " artifact version: " + actual_hash);
     return false;
   }
   return true;

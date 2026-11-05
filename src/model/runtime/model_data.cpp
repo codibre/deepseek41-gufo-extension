@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
 
 #include <algorithm>
@@ -32,6 +33,17 @@
 #include "native_internal.h"
 
 static uint32_t g_ds4_compress_ratios[DS4_N_LAYER] = {0};
+
+/* V4.1 per-layer source routing, resolved from GGUF metadata.  Window-only
+ * layers (compression ratio 0) carry DS4_NO_SOURCE. */
+static constexpr uint32_t DS4_NO_SOURCE = 0xFFFFFFFFu;
+static uint32_t g_ds4_kv_source[DS4_N_LAYER] = {0};
+static uint32_t g_ds4_topk_source[DS4_N_LAYER] = {0};
+static uint32_t g_ds4_cand_source_layer = 0;
+static uint32_t g_ds4_cand_top_k_blocks = 0;
+static uint32_t g_ds4_cand_block_size = 0;
+static int g_ds4_ple_module[DS4_N_LAYER];
+ds4_ple_state g_ds4_ple = {};
 
 static gufo::platform::FileLock g_ds4_lock;
 
@@ -70,6 +82,19 @@ static_assert(sizeof(block_q2_K) == 84);
 static_assert(sizeof(block_q4_K) == 144);
 static_assert(sizeof(block_iq2_xxs) == 66);
 
+struct block_iq2_xs {
+    uint16_t d;
+    uint16_t qs[QK_K / 8];
+    uint8_t  scales[QK_K / 32];
+};
+static_assert(sizeof(block_iq2_xs) == 74);
+
+struct block_iq1_m {
+    uint16_t d;
+    uint8_t  qs[QK_K / 4];
+};
+static_assert(sizeof(block_iq1_m) == 66);
+
 /* =========================================================================
  * Shared Helpers, Allocation Guards, and Cursor Reads.
  * =========================================================================
@@ -98,10 +123,34 @@ uint32_t ds4_layer_compress_ratio(uint32_t il) {
     return g_ds4_compress_ratios[il];
 }
 
-static uint32_t ds4_expected_layer_compress_ratio(uint32_t il) {
+[[maybe_unused]] static uint32_t ds4_expected_layer_compress_ratio(uint32_t il) {
     if (il >= DS4_N_LAYER) ds4_die("DeepSeek4 layer index is outside the loaded model layout");
-    if (il < 2) return 0;
-    return (il & 1u) == 0 ? 4u : 128u;
+    if (il < 2) return 0;        /* window-only prefix */
+    if (il < 20) return 2u;      /* CSA: 2x compression, producers {2, 8, 14} */
+    if (il < 39) return 1u;      /* HCA: 1x compression, producer {20} */
+    return 0;                    /* final window-only layer */
+}
+
+uint32_t ds4_layer_kv_source(uint32_t il) {
+    if (il >= DS4_N_LAYER) ds4_die("DeepSeek4 layer index is outside the loaded model layout");
+    return g_ds4_kv_source[il];
+}
+
+uint32_t ds4_layer_topk_source(uint32_t il) {
+    if (il >= DS4_N_LAYER) ds4_die("DeepSeek4 layer index is outside the loaded model layout");
+    return g_ds4_topk_source[il];
+}
+
+bool ds4_layer_is_kv_source(uint32_t il) {
+    return il < DS4_N_LAYER && g_ds4_kv_source[il] == il;
+}
+
+bool ds4_layer_is_topk_source(uint32_t il) {
+    return il < DS4_N_LAYER && g_ds4_topk_source[il] == il;
+}
+
+int ds4_ple_module_for_layer(uint32_t il) {
+    return il < DS4_N_LAYER ? g_ds4_ple_module[il] : -1;
 }
 
 static void ds4_die_errno(const char *what, const char *path) {
@@ -383,6 +432,32 @@ static bool model_get_u64(const ds4_model *m, const char *key, uint64_t *out) {
         *out = v;
         return true;
     }
+    if (kv->type == GGUF_VALUE_UINT16) {
+        uint16_t v = 0;
+        if (!cursor_read(&c, &v, sizeof(v))) return false;
+        *out = v;
+        return true;
+    }
+    if (kv->type == GGUF_VALUE_UINT8) {
+        uint8_t v = 0;
+        if (!cursor_read(&c, &v, sizeof(v))) return false;
+        *out = v;
+        return true;
+    }
+    if (kv->type == GGUF_VALUE_INT32) {
+        int32_t v = 0;
+        if (!cursor_read(&c, &v, sizeof(v))) return false;
+        if (v < 0) return false;
+        *out = (uint64_t)v;
+        return true;
+    }
+    if (kv->type == GGUF_VALUE_INT64) {
+        int64_t v = 0;
+        if (!cursor_read(&c, &v, sizeof(v))) return false;
+        if (v < 0) return false;
+        *out = (uint64_t)v;
+        return true;
+    }
     return false;
 }
 
@@ -473,6 +548,22 @@ bool ds4_model_string_array_next(ds4_string_iterator *iterator,
 
 static void model_close(ds4_model *m) {
     if (!m) return;
+    if (m->shard_views) {
+        for (uint32_t k = 1; k < m->n_shards; k++) {
+            m->shard_views[k].mapping.Close();
+            if (gufo::platform::FileValid(m->shard_views[k].fd)) {
+                gufo::platform::CloseFile(m->shard_views[k].fd);
+            }
+        }
+        free(m->shard_views);
+        m->shard_views = nullptr;
+    }
+    free(m->shard_slots);
+    m->shard_slots = nullptr;
+    if (m->flat_map) {
+        munmap(m->flat_map, (size_t)m->flat_size);
+        m->flat_map = nullptr;
+    }
     free(m->kv);
     free(m->tensors);
     m->mapping.Close();
@@ -570,6 +661,173 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
     }
 }
 
+/* Split-GGUF support: every shard is mapped whole at a 2 MiB-aligned slot of
+ * one flat PROT_NONE/MAP_FIXED view, so tensor abs_offset values address a
+ * single contiguous map even though the artifact spans six files. */
+static uint64_t ds4_slot_align_up(uint64_t value) {
+    return (value + 0x1FFFFFull) & ~0x1FFFFFull;
+}
+
+static void nth_shard_path(const char *first, uint32_t n, char *out, size_t outlen) {
+    static const char needle[] = "-00001-of-";
+    const char *pos = strstr(first, needle);
+    if (!pos) ds4_die("split GGUF shard names must use the -NNNNN-of-NNNNN form");
+    int written = snprintf(out, outlen, "%.*s-%05u-of-%s",
+                           (int)(pos - first), first, n, pos + (sizeof(needle) - 1));
+    if (written < 0 || (size_t)written >= outlen) ds4_die("split GGUF shard path is too long");
+}
+
+/* Parse one shard's tensor directory into a flat vector.  Relative GGUF
+ * offsets become shard-local absolute offsets; the flat slot base is added
+ * once the slot table is known. */
+static void parse_shard_infos(ds4_model *m, ds4_cursor *c, uint64_t n_tensors,
+                              uint64_t file_size, uint64_t data_pos,
+                              std::vector<ds4_tensor> &out) {
+    for (uint64_t i = 0; i < n_tensors; i++) {
+        ds4_tensor t;
+        memset(&t, 0, sizeof(t));
+        if (!cursor_string(c, &t.name)) ds4_die(c->error);
+        if (!cursor_u32(c, &t.ndim)) ds4_die(c->error);
+        if (t.ndim == 0 || t.ndim > DS4_MAX_DIMS) {
+            ds4_die("tensor has an unsupported number of dimensions");
+        }
+        t.elements = 1;
+        for (uint32_t d = 0; d < t.ndim; d++) {
+            if (!cursor_u64(c, &t.dim[d])) ds4_die(c->error);
+            if (t.dim[d] != 0 && t.elements > UINT64_MAX / t.dim[d]) {
+                ds4_die("tensor element count overflow");
+            }
+            t.elements *= t.dim[d];
+        }
+        if (!cursor_u32(c, &t.type)) ds4_die(c->error);
+        if (!cursor_u64(c, &t.rel_offset)) ds4_die(c->error);
+        if (!tensor_nbytes(t.type, t.elements, &t.bytes)) {
+            gufo::server::Logger::LogFormatted(
+                gufo::server::LogLevel::kWarn, "ds4",
+                "warning: tensor %.*s has unsupported GGUF type %u",
+                (int)t.name.len, t.name.ptr, t.type);
+        }
+        if (t.rel_offset > UINT64_MAX - data_pos) ds4_die("tensor offset overflow");
+        t.abs_offset = data_pos + t.rel_offset;
+        if (t.bytes != 0 &&
+            (t.abs_offset > file_size || t.bytes > file_size - t.abs_offset)) {
+            ds4_die("tensor points outside GGUF shard");
+        }
+        /* The engram row table never goes to the device, so it must not
+         * inflate the resident staging budget. */
+        if (t.bytes > m->max_tensor_bytes &&
+            !(t.ndim == 2 && t.name.len == 27 &&
+              memcmp(t.name.ptr, "per_layer_token_embd.weight", 27) == 0)) {
+            m->max_tensor_bytes = t.bytes;
+        }
+        out.push_back(t);
+    }
+}
+
+static void model_open_split(ds4_model *m, const char *path, ds4_cursor *c,
+                             uint64_t split_count) {
+    if (split_count > 64) ds4_die("split.count is out of range");
+    if (m->n_tensors != 0) {
+        ds4_die("split GGUF with tensors declared in the first shard is not supported");
+    }
+    uint64_t declared = 0;
+    if (model_get_u64(m, "split.tensors.count", &declared) && declared != 0) {
+        /* Actual count is verified after all shard directories are read. */
+    }
+
+    m->shard_views = static_cast<ds4_shard_view *>(
+        calloc((size_t)split_count, sizeof(ds4_shard_view)));
+    m->shard_slots = static_cast<uint64_t *>(calloc((size_t)split_count, sizeof(uint64_t)));
+    if (!m->shard_views || !m->shard_slots) ds4_die("out of memory for split shard table");
+
+    std::vector<ds4_tensor> tvec;
+    std::vector<uint64_t> begin, slot;
+
+    uint64_t total = ds4_slot_align_up(m->size);
+    begin.push_back(0); slot.push_back(0);
+    m->shard_views[0].fd = m->fd;
+    m->shard_views[0].mapping = m->mapping;
+    m->shard_views[0].size = m->size;
+    m->shard_slots[0] = 0;
+    m->n_shards = 1;
+    parse_shard_infos(m, c, m->n_tensors, m->size, m->tensor_data_pos, tvec);
+
+    for (uint32_t k = 1; k < split_count; k++) {
+        char npath[4096];
+        nth_shard_path(path, k + 1, npath, sizeof(npath));
+        gufo::platform::PlatformFile fd = gufo::platform::OpenReadFile(npath);
+        if (!gufo::platform::FileValid(fd)) ds4_die_errno("cannot open split shard", npath);
+        gufo::platform::RawMappedFile mp;
+        if (!mp.Open(npath)) {
+            gufo::platform::CloseFile(fd);
+            ds4_die_errno("cannot map split shard", npath);
+        }
+        m->shard_views[k].fd = fd;
+        m->shard_views[k].mapping = mp;
+        m->shard_views[k].size = mp.size;
+        m->n_shards = k + 1;
+
+        ds4_cursor sc;
+        sc.base = static_cast<const uint8_t *>(mp.data);
+        sc.size = mp.size;
+        sc.pos = 0;
+        sc.error[0] = 0;
+        uint32_t magic = 0, version = 0;
+        uint64_t shard_tensors = 0, shard_kv = 0;
+        if (!cursor_u32(&sc, &magic) || magic != DS4_GGUF_MAGIC) ds4_die("split shard is not a GGUF file");
+        if (!cursor_u32(&sc, &version)) ds4_die(sc.error);
+        if (version != 3) ds4_die("only GGUF v3 is supported");
+        if (!cursor_u64(&sc, &shard_tensors)) ds4_die(sc.error);
+        if (!cursor_u64(&sc, &shard_kv)) ds4_die(sc.error);
+        for (uint64_t i = 0; i < shard_kv; i++) {
+            ds4_str key;
+            uint32_t type = 0;
+            if (!cursor_string(&sc, &key)) ds4_die(sc.error);
+            if (!cursor_u32(&sc, &type)) ds4_die(sc.error);
+            if (!skip_value(&sc, type, 0)) ds4_die(sc.error);
+        }
+        uint64_t data_pos = ds4_align_up(sc.pos, m->alignment);
+        begin.push_back(tvec.size());
+        slot.push_back(total);
+        m->shard_slots[k] = total;
+        total += ds4_slot_align_up(mp.size);
+        parse_shard_infos(m, &sc, shard_tensors, mp.size, data_pos, tvec);
+    }
+
+    if (declared != 0 && declared != tvec.size()) {
+        fprintf(stderr, "ds4: split.tensors.count=%" PRIu64 " but shards declare %zu\n",
+                declared, tvec.size());
+        ds4_die("split GGUF tensor count mismatch");
+    }
+
+    void *flat = mmap(NULL, (size_t)total, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (flat == MAP_FAILED) ds4_die_errno("cannot reserve flat model view", path);
+    for (uint32_t k = 0; k < split_count; k++) {
+        void *at = static_cast<uint8_t *>(flat) + slot[k];
+        void *got = mmap(at, (size_t)m->shard_views[k].size, PROT_READ,
+                         MAP_PRIVATE | MAP_FIXED, m->shard_views[k].fd, 0);
+        if (got == MAP_FAILED) ds4_die_errno("cannot map split shard into flat view", path);
+    }
+
+    m->tensors = static_cast<ds4_tensor *>(
+        calloc(tvec.size() ? tvec.size() : 1, sizeof(ds4_tensor)));
+    if (!m->tensors) ds4_die("out of memory while allocating tensor table");
+    for (size_t r = 0; r < begin.size(); r++) {
+        uint64_t end = (r + 1 < begin.size()) ? begin[r + 1] : tvec.size();
+        for (uint64_t i = begin[r]; i < end; i++) {
+            ds4_tensor *t = &m->tensors[i];
+            *t = tvec[i];
+            t->abs_offset += slot[r];
+        }
+    }
+    m->n_tensors = tvec.size();
+    m->flat_map = flat;
+    m->flat_size = total;
+    m->map = static_cast<const uint8_t *>(flat);
+    m->size = total;
+    m->tensor_data_pos = 0;
+}
+
 /* Open and map the GGUF once for resident ROCm tensor views. */
 static void model_open(ds4_model *m, const char *path) {
     memset(m, 0, sizeof(*m));
@@ -597,8 +855,15 @@ static void model_open(ds4_model *m, const char *path) {
     if (m->version != 3) ds4_die("only GGUF v3 is supported");
 
     parse_metadata(m, &c);
-    parse_tensors(m, &c);
+    m->tensor_data_pos = ds4_align_up(c.pos, m->alignment);
 
+    uint64_t split_count = 1;
+    (void)model_get_u64(m, "split.count", &split_count);
+    if (split_count > 1) {
+        model_open_split(m, path, &c, split_count);
+        return;
+    }
+    parse_tensors(m, &c);
 }
 
 static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
@@ -627,6 +892,12 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
         if (t->bytes == 0) continue;
+        /* The engram row table is host-resident: ROCm gathers IQ4_NL rows on
+         * demand, so it must never enter the device tensor cache. */
+        if (t->name.len == 27 &&
+            memcmp(t->name.ptr, "per_layer_token_embd.weight", 27) == 0) {
+            continue;
+        }
         if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) {
             return false;
         }
@@ -646,6 +917,9 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
         uint64_t end = spans[i].end;
         i++;
         while (i < spans.size() && spans[i].off <= end + 65536u &&
+               /* Flat multi-shard views leave the 2 MiB slot padding
+                * PROT_NONE; never merge a preload span past a slot end. */
+               spans[i].off <= ((end + 0x1FFFFFull) & ~0x1FFFFFull) &&
                spans[i].end - off <= max_span) {
             if (spans[i].end > end) end = spans[i].end;
             i++;
@@ -779,7 +1053,7 @@ static void tensor_expect_layout(
 
     const uint64_t want[3] = { d0, d1, d2 };
     for (uint32_t i = 0; i < ndim; i++) {
-        if (t->dim[i] == want[i]) continue;
+        if (want[i] == UINT64_MAX || t->dim[i] == want[i]) continue;
         fprintf(stderr,
                 "ds4: tensor %.*s has dim[%u]=%" PRIu64 ", expected %" PRIu64 "\n",
                 (int)t->name.len,
@@ -803,6 +1077,8 @@ static void tensor_expect_optional(
 
 static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_IQ2_XXS ||
+           type == DS4_TENSOR_IQ2_XS ||
+           type == DS4_TENSOR_IQ1_M ||
            type == DS4_TENSOR_Q2_K ||
            type == DS4_TENSOR_Q4_K;
 }
@@ -810,6 +1086,8 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
 static uint64_t routed_expert_block_bytes(uint32_t type) {
     switch (type) {
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
+    case DS4_TENSOR_IQ2_XS:  return sizeof(block_iq2_xs);
+    case DS4_TENSOR_IQ1_M:   return sizeof(block_iq1_m);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
     default:                 ds4_die("unsupported routed expert tensor type");
@@ -869,68 +1147,73 @@ static void weights_validate_layout(const ds4_weights *w) {
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t out_low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
 
-    tensor_expect_layout(w->token_embd,      DS4_TENSOR_F16,  2, DS4_N_EMBD, DS4_N_VOCAB, 0);
-    tensor_expect_layout(w->output_hc_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
-    tensor_expect_layout(w->output_hc_fn,    DS4_TENSOR_F16,  2, hc_dim, DS4_N_HC, 0);
-    tensor_expect_layout(w->output_hc_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
-    tensor_expect_layout(w->output_norm,     DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_layout(w->output,          DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    tensor_expect_layout(w->token_embd,     DS4_TENSOR_Q5_K, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    tensor_expect_layout(w->output_norm,    DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+    tensor_expect_layout(w->output,         DS4_TENSOR_Q5_K, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    tensor_expect_layout(w->per_layer_token_embd, DS4_TENSOR_IQ4_NL, 2, DS4_PLE_EMBD,
+                         UINT64_MAX, 0);
+    if (g_ds4_ple.present) {
+        uint64_t rows_needed = 0;
+        for (uint32_t c = 0; c < g_ds4_ple.total_cols; c++) {
+            rows_needed = std::max(rows_needed,
+                                   (uint64_t)g_ds4_ple.offsets[c] + g_ds4_ple.primes[c]);
+        }
+        if (w->per_layer_token_embd->dim[1] < rows_needed) {
+            ds4_die("per_layer_token_embd.weight is smaller than the PLE head table");
+        }
+    }
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         const uint32_t ratio = ds4_layer_compress_ratio(il);
 
-        tensor_expect_layout(l->hc_attn_fn,     DS4_TENSOR_F16,  2, hc_dim, hc_mix_dim, 0);
+        tensor_expect_layout(l->hc_attn_fn,     DS4_TENSOR_F32,  2, hc_dim, hc_mix_dim, 0);
         tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_attn_base,   DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
         tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
         tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
         tensor_expect_layout(l->attn_q_a_norm,  DS4_TENSOR_F32,  1, DS4_N_LORA_Q, 0, 0);
-        tensor_expect_layout(l->attn_q_b,       DS4_TENSOR_Q8_0, 2, DS4_N_LORA_Q, q_dim, 0);
+        tensor_expect_layout(l->attn_q_b,       DS4_TENSOR_Q5_K, 2, DS4_N_LORA_Q, q_dim, 0);
         tensor_expect_layout(l->attn_kv,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
         tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
         tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
-        tensor_expect_layout(l->attn_output_a,  DS4_TENSOR_Q8_0, 2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
-        tensor_expect_layout(l->attn_output_b,  DS4_TENSOR_Q8_0, 2, out_low_dim, DS4_N_EMBD, 0);
+        tensor_expect_layout(l->attn_output_a,  DS4_TENSOR_Q5_K, 2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
+        tensor_expect_layout(l->attn_output_b,  DS4_TENSOR_Q5_K, 2, out_low_dim, DS4_N_EMBD, 0);
 
-        if (ratio != 0) {
-            const uint32_t coff = ratio == 4 ? 2u : 1u;
-            const uint64_t comp_width = (uint64_t)coff * DS4_N_HEAD_DIM;
-            tensor_expect_layout(l->attn_compressor_ape,  DS4_TENSOR_F16, 2, comp_width, ratio, 0);
-            tensor_expect_layout(l->attn_compressor_kv,   DS4_TENSOR_F16, 2, DS4_N_EMBD, comp_width, 0);
-            tensor_expect_layout(l->attn_compressor_gate, DS4_TENSOR_F16, 2, DS4_N_EMBD, comp_width, 0);
-            tensor_expect_layout(l->attn_compressor_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
+        if (ratio != 0 && ds4_layer_is_kv_source(il)) {
+            tensor_expect_layout(l->attn_compressor_kv,   DS4_TENSOR_BF16, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
+            tensor_expect_layout(l->attn_compressor_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
+            tensor_expect_layout(l->indexer_attn_k,       DS4_TENSOR_BF16, 2, DS4_N_HEAD_DIM, DS4_N_INDEXER_HEAD_DIM, 0);
+            tensor_expect_layout(l->indexer_k_norm,       DS4_TENSOR_F32,  1, DS4_N_INDEXER_HEAD_DIM, 0, 0);
+            if (ratio > 1) {
+                tensor_expect_layout(l->attn_compressor_gate, DS4_TENSOR_BF16, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
+            }
         }
-        if (ratio == 4) {
+        if (ratio != 0 && ds4_layer_is_topk_source(il)) {
             const uint64_t index_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
-            const uint64_t index_width = 2u * DS4_N_INDEXER_HEAD_DIM;
-            tensor_expect_layout(l->indexer_attn_q_b,          DS4_TENSOR_F16, 2, DS4_N_LORA_Q, index_q_dim, 0);
-            tensor_expect_layout(l->indexer_proj,              DS4_TENSOR_F16, 2, DS4_N_EMBD, DS4_N_INDEXER_HEAD, 0);
-            tensor_expect_layout(l->indexer_compressor_ape,    DS4_TENSOR_F16, 2, index_width, ratio, 0);
-            tensor_expect_layout(l->indexer_compressor_kv,     DS4_TENSOR_F16, 2, DS4_N_EMBD, index_width, 0);
-            tensor_expect_layout(l->indexer_compressor_gate,   DS4_TENSOR_F16, 2, DS4_N_EMBD, index_width, 0);
-            tensor_expect_layout(l->indexer_compressor_norm,   DS4_TENSOR_F32, 1, DS4_N_INDEXER_HEAD_DIM, 0, 0);
+            tensor_expect_layout(l->indexer_attn_q_b, DS4_TENSOR_BF16, 2, DS4_N_LORA_Q, index_q_dim, 0);
+            tensor_expect_layout(l->indexer_proj,     DS4_TENSOR_BF16, 2, DS4_N_EMBD, DS4_N_INDEXER_HEAD, 0);
         }
 
-        tensor_expect_layout(l->hc_ffn_fn,      DS4_TENSOR_F16,  2, hc_dim, hc_mix_dim, 0);
+        tensor_expect_layout(l->hc_ffn_fn,      DS4_TENSOR_F32,  2, hc_dim, hc_mix_dim, 0);
         tensor_expect_layout(l->hc_ffn_scale,   DS4_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_ffn_base,    DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
         tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-        tensor_expect_layout(l->ffn_gate_inp,   DS4_TENSOR_F16,  2, DS4_N_EMBD, DS4_N_EXPERT, 0);
+        tensor_expect_layout(l->ffn_gate_inp,   DS4_TENSOR_BF16, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
         tensor_expect_optional(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
         tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
-        if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
-            fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
-            throw std::runtime_error(
-                "incompatible or invalid DeepSeek artifact");
-        }
-        tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q8_0,    2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_Q8_0,    2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0,    2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
-        if (il < DS4_N_HASH_LAYER) {
-            tensor_expect_layout(l->ffn_gate_tid2eid, DS4_TENSOR_I32, 2, DS4_N_EXPERT_USED, DS4_N_VOCAB, 0);
+        /* GSQ mixes quant types per tensor (imatrix-chosen); each routed
+        * expert slab is dispatched by its own type downstream. */
+        tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q5_K,    2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_Q5_K,    2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q5_K,    2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+
+        if (g_ds4_ple.present && ds4_ple_module_for_layer(il) >= 0) {
+            tensor_expect_layout(l->engram_kv,   DS4_TENSOR_Q5_K, 2,
+                                 (uint64_t)g_ds4_ple.cols_per_module * DS4_PLE_EMBD, 25600, 0);
+            tensor_expect_layout(l->engram_gate, DS4_TENSOR_F32,  2, DS4_N_EMBD, DS4_N_HC, 0);
         }
     }
 }
@@ -1029,7 +1312,7 @@ static void ds4_select_shape_from_metadata(
 }
 
 static void validate_compress_ratio_metadata(const ds4_model *m) {
-    const char *key = "deepseek4.attention.compress_ratios";
+    const char *key = "deepseek41.attention.compress_ratios";
     ds4_array_ref arr;
     if (!model_get_array(m, key, &arr) ||
         (arr.type != GGUF_VALUE_UINT32 && arr.type != GGUF_VALUE_INT32)) {
@@ -1037,7 +1320,7 @@ static void validate_compress_ratio_metadata(const ds4_model *m) {
         throw std::runtime_error("incompatible or invalid DeepSeek artifact");
     }
     if (arr.len < DS4_N_LAYER) {
-        ds4_die("deepseek4.attention.compress_ratios is shorter than the layer count");
+        ds4_die("deepseek41.attention.compress_ratios is shorter than the layer count");
     }
 
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
@@ -1053,22 +1336,30 @@ static void validate_compress_ratio_metadata(const ds4_model *m) {
             got = (uint32_t)v;
         }
 
-        const uint32_t expected = ds4_expected_layer_compress_ratio(il);
-        if (got != expected) {
+        /* Metadata is authoritative for V4.1: ratios are 0 (window-only),
+         * 1 (HCA) or 2 (CSA).  The producer tables below pin the rest. */
+        if (got > 2u) {
             fprintf(stderr,
-                    "ds4: unexpected DeepSeek4 compression ratio at layer %u for %s: got %u, expected %u\n",
-                    il, DS4_MODEL_SHAPE_NAME, got, expected);
+                    "ds4: unsupported compression ratio %u at layer %u\n", got, il);
             throw std::runtime_error(
                 "incompatible or invalid DeepSeek artifact");
         }
         g_ds4_compress_ratios[il] = got;
     }
+    bool any_hca = false, any_csa = false;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        any_hca = any_hca || g_ds4_compress_ratios[il] == 1u;
+        any_csa = any_csa || g_ds4_compress_ratios[il] == 2u;
+    }
+    if (g_ds4_compress_ratios[0] != 0u || !any_hca || !any_csa) {
+        ds4_die("compression ratio layout is not V4.1 (window + CSA + HCA)");
+    }
 }
 
 static void config_expect_f32(const char *name, float got, float expected);
 
-static void validate_swiglu_clamp_metadata(const ds4_model *m) {
-    const char *key = "deepseek4.swiglu_clamp_exp";
+static void validate_swiglu_clamp_array(const ds4_model *m, const char *key,
+                                        const char *name) {
     ds4_array_ref arr;
     if (!model_get_array(m, key, &arr) ||
         (arr.type != GGUF_VALUE_FLOAT32 && arr.type != GGUF_VALUE_FLOAT64)) {
@@ -1076,7 +1367,7 @@ static void validate_swiglu_clamp_metadata(const ds4_model *m) {
         throw std::runtime_error("incompatible or invalid DeepSeek artifact");
     }
     if (arr.len < DS4_N_LAYER) {
-        ds4_die("deepseek4.swiglu_clamp_exp is shorter than the layer count");
+        ds4_die("swiglu clamp array is shorter than the layer count");
     }
 
     ds4_cursor c = cursor_at(m, arr.data_pos);
@@ -1089,8 +1380,13 @@ static void validate_swiglu_clamp_metadata(const ds4_model *m) {
             if (!cursor_read(&c, &v, sizeof(v))) ds4_die(c.error);
             got = (float)v;
         }
-        config_expect_f32("swiglu_clamp_exp", got, DS4_SWIGLU_CLAMP_EXP);
+        config_expect_f32(name, got, DS4_SWIGLU_CLAMP_EXP);
     }
+}
+
+static void validate_swiglu_clamp_metadata(const ds4_model *m) {
+    validate_swiglu_clamp_array(m, "deepseek41.swiglu_clamp_exp", "swiglu_clamp_exp");
+    validate_swiglu_clamp_array(m, "deepseek41.swiglu_clamp_shexp", "swiglu_clamp_shexp");
 }
 
 static void config_expect_u32(const char *name, uint32_t got, uint32_t expected) {
@@ -1119,35 +1415,45 @@ static void config_validate_fixed_shape(uint32_t n_layer) {
     config_expect_u32("block_count",                  n_layer,                 DS4_N_LAYER);
 }
 
+static void validate_source_layer_metadata(const ds4_model *m);
+static void validate_ple_metadata(const ds4_model *m);
+
 /* Validate metadata values that affect semantics: attention shape, HC count,
  * expert routing, RoPE scaling, compression ratios, and SwiGLU clamp. */
 static void config_validate_model(const ds4_model *m) {
-    const uint32_t n_layer = required_u32(m, "deepseek4.block_count");
-    const uint32_t n_embd = required_u32(m, "deepseek4.embedding_length");
-    const uint32_t n_vocab = required_u32(m, "deepseek4.vocab_size");
-    const uint32_t n_head = required_u32(m, "deepseek4.attention.head_count");
-    const uint32_t n_head_kv = required_u32(m, "deepseek4.attention.head_count_kv");
-    const uint32_t n_head_dim = required_u32(m, "deepseek4.attention.key_length");
-    const uint32_t n_value_dim = required_u32(m, "deepseek4.attention.value_length");
-    const uint32_t n_rot = required_u32(m, "deepseek4.rope.dimension_count");
-    const uint32_t n_lora_q = required_u32(m, "deepseek4.attention.q_lora_rank");
-    const uint32_t n_lora_o = required_u32(m, "deepseek4.attention.output_lora_rank");
-    const uint32_t n_out_group = required_u32(m, "deepseek4.attention.output_group_count");
-    const uint32_t n_expert = required_u32(m, "deepseek4.expert_count");
-    const uint32_t n_expert_used = required_u32(m, "deepseek4.expert_used_count");
-    const uint32_t n_ff_exp = required_u32(m, "deepseek4.expert_feed_forward_length");
-    const uint32_t n_expert_shared = required_u32(m, "deepseek4.expert_shared_count");
-    const uint32_t n_hash_layer = required_u32(m, "deepseek4.hash_layer_count");
+    const uint32_t n_layer = required_u32(m, "deepseek41.block_count");
+    const uint32_t n_embd = required_u32(m, "deepseek41.embedding_length");
+    /* V4.1 checkpoints do not carry a vocab_size metadata key; derive it
+     * from the embedding tensor. */
+    const ds4_tensor *embd_tensor = model_find_tensor(m, "token_embd.weight");
+    if (!embd_tensor || embd_tensor->ndim < 2 || embd_tensor->dim[1] == 0 ||
+        embd_tensor->dim[1] > UINT32_MAX) {
+        ds4_die("token_embd.weight is unavailable for deriving the vocab size");
+    }
+    const uint32_t n_vocab = (uint32_t)embd_tensor->dim[1];
+    const uint32_t n_head = required_u32(m, "deepseek41.attention.head_count");
+    const uint32_t n_head_kv = required_u32(m, "deepseek41.attention.head_count_kv");
+    const uint32_t n_head_dim = required_u32(m, "deepseek41.attention.key_length");
+    const uint32_t n_value_dim = required_u32(m, "deepseek41.attention.value_length");
+    const uint32_t n_rot = required_u32(m, "deepseek41.rope.dimension_count");
+    const uint32_t n_lora_q = required_u32(m, "deepseek41.attention.q_lora_rank");
+    const uint32_t n_lora_o = required_u32(m, "deepseek41.attention.output_lora_rank");
+    const uint32_t n_out_group = required_u32(m, "deepseek41.attention.output_group_count");
+    const uint32_t n_expert = required_u32(m, "deepseek41.expert_count");
+    const uint32_t n_expert_used = required_u32(m, "deepseek41.expert_used_count");
+    const uint32_t n_ff_exp = required_u32(m, "deepseek41.expert_feed_forward_length");
+    const uint32_t n_expert_shared = required_u32(m, "deepseek41.expert_shared_count");
+    const uint32_t n_hash_layer = required_u32(m, "deepseek41.hash_layer_count");
     uint32_t n_expert_groups = 0;
     uint32_t n_group_used = 0;
-    model_get_u32(m, "deepseek4.expert_group_count", &n_expert_groups);
-    model_get_u32(m, "deepseek4.expert_group_used_count", &n_group_used);
-    const uint32_t n_swa = required_u32(m, "deepseek4.attention.sliding_window");
-    const uint32_t n_indexer_head = required_u32(m, "deepseek4.attention.indexer.head_count");
-    const uint32_t n_indexer_head_dim = required_u32(m, "deepseek4.attention.indexer.key_length");
-    const uint32_t n_indexer_top_k = required_u32(m, "deepseek4.attention.indexer.top_k");
-    const uint32_t n_hc = required_u32(m, "deepseek4.hyper_connection.count");
-    const uint32_t n_hc_sinkhorn_iter = required_u32(m, "deepseek4.hyper_connection.sinkhorn_iterations");
+    model_get_u32(m, "deepseek41.expert_group_count", &n_expert_groups);
+    model_get_u32(m, "deepseek41.expert_group_used_count", &n_group_used);
+    const uint32_t n_swa = required_u32(m, "deepseek41.attention.sliding_window");
+    const uint32_t n_indexer_head = required_u32(m, "deepseek41.attention.indexer.head_count");
+    const uint32_t n_indexer_head_dim = required_u32(m, "deepseek41.attention.indexer.key_length");
+    const uint32_t n_indexer_top_k = required_u32(m, "deepseek41.attention.indexer.top_k");
+    const uint32_t n_hc = required_u32(m, "deepseek41.hyper_connection.count");
+    const uint32_t n_hc_sinkhorn_iter = required_u32(m, "deepseek41.hyper_connection.sinkhorn_iterations");
 
     ds4_select_shape_from_metadata(n_layer,
                                    n_embd,
@@ -1203,34 +1509,251 @@ static void config_validate_model(const ds4_model *m) {
     validate_swiglu_clamp_metadata(m);
 
     uint64_t rope_orig_ctx = DS4_ROPE_ORIG_CTX;
-    model_get_u64(m, "deepseek4.rope.scaling.original_context_length", &rope_orig_ctx);
+    model_get_u64(m, "deepseek41.rope.scaling.original_context_length", &rope_orig_ctx);
     if (rope_orig_ctx != DS4_ROPE_ORIG_CTX) {
         fprintf(stderr, "ds4: expected rope.scaling.original_context_length=%" PRIu64
                 " for %s, got %" PRIu64 "\n",
                 (uint64_t)DS4_ROPE_ORIG_CTX, DS4_MODEL_SHAPE_NAME, rope_orig_ctx);
         throw std::runtime_error("incompatible or invalid DeepSeek artifact");
     }
-    const float rope_freq_base = required_f32(m, "deepseek4.rope.freq_base");
+    const float rope_freq_base = required_f32(m, "deepseek41.rope.freq_base");
     config_expect_f32("rope.freq_base", rope_freq_base, DS4_ROPE_FREQ_BASE);
     float rope_scale_factor = DS4_ROPE_SCALE_FACTOR;
-    model_get_f32(m, "deepseek4.rope.scaling.factor", &rope_scale_factor);
+    model_get_f32(m, "deepseek41.rope.scaling.factor", &rope_scale_factor);
     config_expect_f32("rope.scaling.factor", rope_scale_factor, DS4_ROPE_SCALE_FACTOR);
     float rope_yarn_beta_fast = DS4_ROPE_YARN_BETA_FAST;
-    model_get_f32(m, "deepseek4.rope.scaling.yarn_beta_fast", &rope_yarn_beta_fast);
+    model_get_f32(m, "deepseek41.rope.scaling.yarn_beta_fast", &rope_yarn_beta_fast);
     config_expect_f32("rope.scaling.yarn_beta_fast", rope_yarn_beta_fast, DS4_ROPE_YARN_BETA_FAST);
     float rope_yarn_beta_slow = DS4_ROPE_YARN_BETA_SLOW;
-    model_get_f32(m, "deepseek4.rope.scaling.yarn_beta_slow", &rope_yarn_beta_slow);
+    model_get_f32(m, "deepseek41.rope.scaling.yarn_beta_slow", &rope_yarn_beta_slow);
     config_expect_f32("rope.scaling.yarn_beta_slow", rope_yarn_beta_slow, DS4_ROPE_YARN_BETA_SLOW);
-    const float compress_rope_freq_base = required_f32(m, "deepseek4.attention.compress_rope_freq_base");
+    const float compress_rope_freq_base = required_f32(m, "deepseek41.attention.compress_rope_freq_base");
     config_expect_f32("attention.compress_rope_freq_base", compress_rope_freq_base, DS4_COMPRESS_ROPE_FREQ_BASE);
-    const float expert_weight_scale = required_f32(m, "deepseek4.expert_weights_scale");
+    const float expert_weight_scale = required_f32(m, "deepseek41.expert_weights_scale");
     config_expect_f32("expert_weights_scale", expert_weight_scale, DS4_EXPERT_WEIGHT_SCALE);
-    const float rms_eps = required_f32(m, "deepseek4.attention.layer_norm_rms_epsilon");
+    const float rms_eps = required_f32(m, "deepseek41.attention.layer_norm_rms_epsilon");
     config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, DS4_RMS_EPS);
-    const float hc_eps = required_f32(m, "deepseek4.hyper_connection.epsilon");
+    const float hc_eps = required_f32(m, "deepseek41.hyper_connection.epsilon");
     config_expect_f32("hyper_connection.epsilon", hc_eps, DS4_HC_EPS);
-    const bool expert_weight_norm = required_bool(m, "deepseek4.expert_weights_norm");
+    const bool expert_weight_norm = required_bool(m, "deepseek41.expert_weights_norm");
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
+    uint32_t gating_func = 4;
+    if (model_get_u32(m, "deepseek41.expert_gating_func", &gating_func)) {
+        config_expect_u32("expert_gating_func", gating_func, 4);
+    }
+    validate_source_layer_metadata(m);
+    validate_ple_metadata(m);
+}
+
+static bool read_u32ish_array(const ds4_model *m, const char *key,
+                              uint32_t *buf, uint32_t cap, uint32_t *len_out) {
+    ds4_array_ref arr;
+    if (!model_get_array(m, key, &arr)) { *len_out = 0; return true; }
+    if (arr.type != GGUF_VALUE_UINT32 && arr.type != GGUF_VALUE_INT32) {
+        fprintf(stderr, "ds4: metadata key %s must be an int32/uint32 array\n", key);
+        throw std::runtime_error("incompatible or invalid DeepSeek artifact");
+    }
+    if (arr.len > cap) ds4_die("metadata array is longer than supported");
+    ds4_cursor c = cursor_at(m, arr.data_pos);
+    for (uint64_t i = 0; i < arr.len; i++) {
+        if (arr.type == GGUF_VALUE_UINT32) {
+            if (!cursor_u32(&c, &buf[i])) ds4_die(c.error);
+        } else {
+            int32_t v = 0;
+            if (!cursor_read(&c, &v, sizeof(v))) ds4_die(c.error);
+            if (v < 0) ds4_die("metadata array contains a negative value");
+            buf[i] = (uint32_t)v;
+        }
+    }
+    *len_out = (uint32_t)arr.len;
+    return true;
+}
+
+/* Resolve V4.1 compressed-KV producers, indexer top-k sources, and the
+ * candidate-block selection parameters into per-layer tables. */
+static void validate_source_layer_metadata(const ds4_model *m) {
+    uint32_t kv_src[8]; uint32_t n_kv_src = 0;
+    uint32_t idx_src[16]; uint32_t n_idx_src = 0;
+    read_u32ish_array(m, "deepseek41.attention.kv_source_layers", kv_src, 8, &n_kv_src);
+    read_u32ish_array(m, "deepseek41.attention.indexer.source_layers", idx_src, 16, &n_idx_src);
+    if (n_kv_src == 0 || n_idx_src == 0) {
+        ds4_die("missing deepseek41.attention.kv_source_layers / indexer.source_layers");
+    }
+    for (uint32_t i = 0; i < n_kv_src; i++) {
+        if (kv_src[i] >= DS4_N_LAYER || g_ds4_compress_ratios[kv_src[i]] == 0) {
+            ds4_die("kv_source_layers references a layer without compression");
+        }
+        if (i > 0 && kv_src[i] <= kv_src[i - 1]) ds4_die("kv_source_layers must increase");
+    }
+    for (uint32_t i = 0; i < n_idx_src; i++) {
+        if (idx_src[i] >= DS4_N_LAYER || g_ds4_compress_ratios[idx_src[i]] == 0) {
+            ds4_die("indexer.source_layers references a layer without compression");
+        }
+        if (i > 0 && idx_src[i] <= idx_src[i - 1]) ds4_die("indexer.source_layers must increase");
+    }
+    uint64_t cand_layer = 0, cand_blocks = 0, cand_block_size = 0;
+    if (!model_get_u64(m, "deepseek41.attention.indexer.candidate_source_layer", &cand_layer) ||
+        !model_get_u64(m, "deepseek41.attention.indexer.candidate_top_k_blocks", &cand_blocks) ||
+        !model_get_u64(m, "deepseek41.attention.indexer.candidate_block_size", &cand_block_size)) {
+        ds4_die("missing indexer candidate-block metadata");
+    }
+    if (cand_layer >= DS4_N_LAYER || cand_blocks == 0 || cand_blocks > 65536 ||
+        cand_block_size == 0 || cand_block_size > 64) {
+        ds4_die("unsupported indexer candidate-block metadata");
+    }
+    g_ds4_cand_source_layer = (uint32_t)cand_layer;
+    g_ds4_cand_top_k_blocks = (uint32_t)cand_blocks;
+    g_ds4_cand_block_size = (uint32_t)cand_block_size;
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g_ds4_kv_source[il] = DS4_NO_SOURCE;
+        g_ds4_topk_source[il] = DS4_NO_SOURCE;
+        if (g_ds4_compress_ratios[il] == 0) continue;
+        for (uint32_t i = 0; i < n_kv_src; i++) {
+            if (kv_src[i] <= il) g_ds4_kv_source[il] = kv_src[i];
+        }
+        if (g_ds4_kv_source[il] == DS4_NO_SOURCE) {
+            ds4_die("compressed layer precedes every kv source layer");
+        }
+        for (uint32_t i = 0; i < n_idx_src; i++) {
+            if (idx_src[i] <= il) g_ds4_topk_source[il] = idx_src[i];
+        }
+        if (g_ds4_topk_source[il] == DS4_NO_SOURCE) {
+            ds4_die("compressed layer precedes every indexer source layer");
+        }
+    }
+}
+
+/* Copy a numeric GGUF array into a fixed buffer, accepting any int/uint
+ * width the writer chose. */
+static void read_ple_u64_array(const ds4_model *m, const char *key,
+                               uint64_t *dst, uint64_t want) {
+    ds4_array_ref arr;
+    if (!model_get_array(m, key, &arr) || arr.len != want) {
+        fprintf(stderr, "ds4: invalid PLE metadata array: %s\n", key);
+        throw std::runtime_error("incompatible or invalid DeepSeek artifact");
+    }
+    ds4_cursor c = cursor_at(m, arr.data_pos);
+    for (uint64_t i = 0; i < want; i++) {
+        switch (arr.type) {
+        case GGUF_VALUE_UINT64: if (!cursor_u64(&c, &dst[i])) ds4_die(c.error); break;
+        case GGUF_VALUE_INT64: {
+            int64_t v = 0; if (!cursor_read(&c, &v, sizeof(v))) ds4_die(c.error);
+            if (v < 0) ds4_die("negative PLE metadata value"); dst[i] = (uint64_t)v; break;
+        }
+        case GGUF_VALUE_UINT32: {
+            uint32_t v = 0; if (!cursor_u32(&c, &v)) ds4_die(c.error); dst[i] = v; break;
+        }
+        case GGUF_VALUE_INT32: {
+            int32_t v = 0; if (!cursor_read(&c, &v, sizeof(v))) ds4_die(c.error);
+            if (v < 0) ds4_die("negative PLE metadata value"); dst[i] = (uint64_t)v; break;
+        }
+        default:
+            fprintf(stderr, "ds4: unsupported PLE array element type %u: %s\n",
+                    arr.type, key);
+            throw std::runtime_error("incompatible or invalid DeepSeek artifact");
+        }
+    }
+}
+
+/* Engram/PLE metadata: n-gram head table geometry, hash multipliers, and the
+ * token->class map.  The 110 GB IQ4_NL row table itself is validated with the
+ * tensor layout; only its geometry is checked here. */
+static void validate_ple_metadata(const ds4_model *m) {
+    for (uint32_t i = 0; i < DS4_N_LAYER; i++) g_ds4_ple_module[i] = -1;
+    ds4_ple_state ple = {};
+
+    ds4_array_ref arr;
+    if (!model_get_array(m, "deepseek41.ple.layers", &arr)) return;
+    ple.present = 1;
+    uint32_t ngram = 0, heads_per_ngram = 0;
+    if (!model_get_u32(m, "deepseek41.ple.ngram_size", &ngram) || ngram < 2 || ngram > 8) {
+        ds4_die("unsupported deepseek41.ple.ngram_size");
+    }
+    if (!model_get_u32(m, "deepseek41.ple.heads_per_ngram", &heads_per_ngram) ||
+        heads_per_ngram == 0 || heads_per_ngram > DS4_PLE_MAX_COLS) {
+        ds4_die("unsupported deepseek41.ple.heads_per_ngram");
+    }
+    if (arr.type != GGUF_VALUE_UINT32 && arr.type != GGUF_VALUE_INT32) {
+        ds4_die("deepseek41.ple.layers must be an int array");
+    }
+    if (arr.len == 0 || arr.len > DS4_PLE_MAX_LAYERS) ds4_die("unsupported ple.layers length");
+    uint32_t n_modules = (uint32_t)arr.len;
+    uint64_t cols_per_module = (uint64_t)(ngram - 1) * heads_per_ngram;
+    uint64_t total_cols = cols_per_module * n_modules;
+    if (total_cols > DS4_PLE_MAX_TOTAL_COLS) ds4_die("PLE head table is too wide");
+
+    ds4_cursor c = cursor_at(m, arr.data_pos);
+    for (uint64_t i = 0; i < arr.len; i++) {
+        uint32_t layer = 0;
+        if (arr.type == GGUF_VALUE_UINT32) {
+            if (!cursor_u32(&c, &layer)) ds4_die(c.error);
+        } else {
+            int32_t v = 0;
+            if (!cursor_read(&c, &v, sizeof(v))) ds4_die(c.error);
+            if (v < 0) ds4_die("negative ple layer");
+            layer = (uint32_t)v;
+        }
+        if (layer >= DS4_N_LAYER) ds4_die("ple.layers references an unknown layer");
+        if (g_ds4_ple_module[layer] >= 0) ds4_die("duplicate ple layer");
+        g_ds4_ple_module[layer] = (int)i;
+        ple.layers[i] = layer;
+    }
+
+    ple.ngram = ngram;
+    ple.heads_per_ngram = heads_per_ngram;
+    ple.n_modules = n_modules;
+    ple.cols_per_module = (uint32_t)cols_per_module;
+    ple.total_cols = (uint32_t)total_cols;
+    read_ple_u64_array(m, "deepseek41.ple.layer_multipliers",
+                       ple.multipliers, (uint64_t)n_modules * ngram);
+    {
+        uint64_t wide[DS4_PLE_MAX_TOTAL_COLS];
+        read_ple_u64_array(m, "deepseek41.ple.head_offsets", wide, total_cols);
+        for (uint64_t i = 0; i < total_cols; i++) {
+            if (wide[i] > UINT32_MAX) ds4_die("PLE head offset too large");
+            ple.offsets[i] = (uint32_t)wide[i];
+        }
+        read_ple_u64_array(m, "deepseek41.ple.head_vocab_sizes", wide, total_cols);
+        for (uint64_t i = 0; i < total_cols; i++) {
+            if (wide[i] > UINT32_MAX) ds4_die("PLE head vocab too large");
+            ple.primes[i] = (uint32_t)wide[i];
+        }
+    }
+    {
+        ds4_array_ref ma;
+        if (!model_get_array(m, "deepseek41.engram.token_map", &ma) ||
+            ma.len == 0 || ma.len > (1u << 24)) {
+            ds4_die("missing deepseek41.engram.token_map");
+        }
+        ple.token_map.resize((size_t)ma.len);
+        ds4_cursor c = cursor_at(m, ma.data_pos);
+        for (uint64_t i = 0; i < ma.len; i++) {
+            int64_t v = -1;
+            switch (ma.type) {
+            case GGUF_VALUE_UINT32: { uint32_t x=0; if (!cursor_u32(&c,&x)) ds4_die(c.error); v=x; break; }
+            case GGUF_VALUE_INT32:  { int32_t x=0; if (!cursor_read(&c,&x,sizeof(x))) ds4_die(c.error); v=x; break; }
+            case GGUF_VALUE_UINT64: { uint64_t x=0; if (!cursor_u64(&c,&x)) ds4_die(c.error); v=(int64_t)x; break; }
+            case GGUF_VALUE_INT64:  { if (!cursor_read(&c,&v,sizeof(v))) ds4_die(c.error); break; }
+            default: ds4_die("unsupported deepseek41.engram.token_map element type");
+            }
+            ple.token_map[(size_t)i] = (int32_t)v;
+        }
+    }    uint32_t pad_id = 0;
+    if (!model_get_u32(m, "deepseek41.engram.pad_token_id", &pad_id) ||
+        pad_id >= ple.token_map.size()) {
+        ds4_die("deepseek41.engram.pad_token_id is outside the token map");
+    }
+    ple.pad_class = ple.token_map[(size_t)pad_id];
+    {
+        uint32_t pad_tok = 0;
+        ple.dead_token_id = DS4_PLE_DEAD;
+        if (model_get_u32(m, "tokenizer.ggml.padding_token_id", &pad_tok) &&
+            pad_tok < ple.token_map.size()) {
+            ple.dead_token_id = ple.token_map[(size_t)pad_tok];
+        }
+    }
+    g_ds4_ple = ple;
 }
 
 /* Bind tensor names once into the fixed DS4 layer layout.  This is the point
@@ -1238,11 +1761,9 @@ static void config_validate_model(const ds4_model *m) {
 static void weights_bind(ds4_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
     w->token_embd       = required_tensor(m, "token_embd.weight");
-    w->output_hc_base   = required_tensor(m, "output_hc_base.weight");
-    w->output_hc_fn     = required_tensor(m, "output_hc_fn.weight");
-    w->output_hc_scale  = required_tensor(m, "output_hc_scale.weight");
     w->output_norm      = required_tensor(m, "output_norm.weight");
     w->output           = required_tensor(m, "output.weight");
+    w->per_layer_token_embd = required_tensor(m, "per_layer_token_embd.weight");
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_layer_weights *l = &w->layer[il];
@@ -1260,19 +1781,23 @@ static void weights_bind(ds4_weights *w, const ds4_model *m) {
         l->attn_sinks      = required_tensorf(m, "blk.%u.attn_sinks.weight", il);
         l->attn_output_a   = required_tensorf(m, "blk.%u.attn_output_a.weight", il);
         l->attn_output_b   = required_tensorf(m, "blk.%u.attn_output_b.weight", il);
-        if (compress_ratio != 0) {
-            l->attn_compressor_ape  = required_tensorf(m, "blk.%u.attn_compressor_ape.weight", il);
+        /* V4.1: compression weights live only on producer (kv source) layers;
+         * the gate exists only where the ratio is > 1 (CSA producers).  There
+         * are no APE tensors: positional encoding of compressed rows reuses
+         * the layer rope. */
+        if (compress_ratio != 0 && ds4_layer_is_kv_source(il)) {
             l->attn_compressor_kv   = required_tensorf(m, "blk.%u.attn_compressor_kv.weight", il);
-            l->attn_compressor_gate = required_tensorf(m, "blk.%u.attn_compressor_gate.weight", il);
             l->attn_compressor_norm = required_tensorf(m, "blk.%u.attn_compressor_norm.weight", il);
+            l->indexer_attn_k       = required_tensorf(m, "blk.%u.indexer.attn_k.weight", il);
+            l->indexer_k_norm       = required_tensorf(m, "blk.%u.indexer.k_norm.weight", il);
+            if (compress_ratio > 1) {
+                l->attn_compressor_gate = required_tensorf(m, "blk.%u.attn_compressor_gate.weight", il);
+            }
         }
-        if (compress_ratio == 4) {
+        /* Indexer query weights exist only on top-k source layers. */
+        if (compress_ratio != 0 && ds4_layer_is_topk_source(il)) {
             l->indexer_attn_q_b = required_tensorf(m, "blk.%u.indexer.attn_q_b.weight", il);
             l->indexer_proj     = required_tensorf(m, "blk.%u.indexer.proj.weight", il);
-            l->indexer_compressor_ape  = required_tensorf(m, "blk.%u.indexer_compressor_ape.weight", il);
-            l->indexer_compressor_kv   = required_tensorf(m, "blk.%u.indexer_compressor_kv.weight", il);
-            l->indexer_compressor_gate = required_tensorf(m, "blk.%u.indexer_compressor_gate.weight", il);
-            l->indexer_compressor_norm = required_tensorf(m, "blk.%u.indexer_compressor_norm.weight", il);
         }
         l->hc_ffn_fn       = required_tensorf(m, "blk.%u.hc_ffn_fn.weight", il);
         l->hc_ffn_scale    = required_tensorf(m, "blk.%u.hc_ffn_scale.weight", il);
@@ -1287,8 +1812,10 @@ static void weights_bind(ds4_weights *w, const ds4_model *m) {
         l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
         l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
 
-        if (il < DS4_N_HASH_LAYER) {
-            l->ffn_gate_tid2eid = required_tensorf(m, "blk.%u.ffn_gate_tid2eid.weight", il);
+        /* Engram/PLE injection weights exist only on ple.layers. */
+        if (g_ds4_ple.present && ds4_ple_module_for_layer(il) >= 0) {
+            l->engram_kv   = required_tensorf(m, "blk.%u.engram_kv.weight", il);
+            l->engram_gate = required_tensorf(m, "blk.%u.engram_gate.weight", il);
         }
     }
 
@@ -1699,6 +2226,24 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
 
     (void)ds4_gpu_set_model_fd(e->model->fd);
+    if (e->model->n_shards > 1) {
+        const ds4_model *mm = e->model;
+        std::vector<const void *> flats(mm->n_shards);
+        std::vector<uint64_t> sizes(mm->n_shards);
+        std::vector<gufo::platform::PlatformFile> fds(mm->n_shards);
+        for (uint32_t k = 0; k < mm->n_shards; k++) {
+            flats[k] = mm->map + mm->shard_slots[k];
+            sizes[k] = mm->shard_views[k].mapping.size;
+            fds[k] = mm->shard_views[k].fd;
+        }
+        if (!ds4_gpu_set_model_shards(flats.data(), sizes.data(), fds.data(),
+                                      mm->n_shards)) {
+            fprintf(stderr, "ds4: ROCm failed to register split model shards\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+    }
     if (!ds4_gpu_set_model_map_range(e->model->map,
                                      e->model->size,
                                      e->model->tensor_data_pos,

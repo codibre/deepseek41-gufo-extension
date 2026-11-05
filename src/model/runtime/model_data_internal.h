@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #include <gufo/ext/platform/mapped_file.hpp>
 
@@ -12,8 +13,8 @@
 inline constexpr float DS4_NEG_INF = -1.0e30F;
 inline constexpr float DS4_POS_INF = 1.0e30F;
 
-inline constexpr uint32_t DS4_N_LAYER = 43;
-inline constexpr uint32_t DS4_N_EMBD = 4096;
+inline constexpr uint32_t DS4_N_LAYER = 40;
+inline constexpr uint32_t DS4_N_EMBD = 5120;
 inline constexpr uint32_t DS4_N_VOCAB = 129280;
 inline constexpr uint32_t DS4_N_HEAD = 64;
 inline constexpr uint32_t DS4_N_HEAD_KV = 1;
@@ -21,15 +22,15 @@ inline constexpr uint32_t DS4_N_HEAD_DIM = 512;
 inline constexpr uint32_t DS4_N_VALUE_DIM = 512;
 inline constexpr uint32_t DS4_N_ROT = 64;
 inline constexpr uint32_t DS4_N_OUT_GROUP = 8;
-inline constexpr uint32_t DS4_N_LORA_Q = 1024;
+inline constexpr uint32_t DS4_N_LORA_Q = 1280;
 inline constexpr uint32_t DS4_N_LORA_O = 1024;
-inline constexpr uint32_t DS4_N_EXPERT = 256;
+inline constexpr uint32_t DS4_N_EXPERT = 192;
 inline constexpr uint32_t DS4_N_EXPERT_USED = 6;
 inline constexpr uint32_t DS4_N_EXPERT_SHARED = 1;
-inline constexpr uint32_t DS4_N_FF_EXP = 2048;
-inline constexpr uint32_t DS4_N_HASH_LAYER = 3;
+inline constexpr uint32_t DS4_N_FF_EXP = 2304;
+inline constexpr uint32_t DS4_N_HASH_LAYER = 0;
 inline constexpr uint32_t DS4_N_SWA = 128;
-inline constexpr uint32_t DS4_N_INDEXER_HEAD = 64;
+inline constexpr uint32_t DS4_N_INDEXER_HEAD = 32;
 inline constexpr uint32_t DS4_N_INDEXER_HEAD_DIM = 128;
 inline constexpr uint32_t DS4_N_INDEXER_TOP_K = 512;
 inline constexpr uint32_t DS4_N_HC = 4;
@@ -37,8 +38,8 @@ inline constexpr uint32_t DS4_N_HC_SINKHORN_ITER = 20;
 inline constexpr uint32_t DS4_MAX_DIMS = 8;
 inline constexpr uint32_t DS4_MAX_LAYER = DS4_N_LAYER;
 
-inline constexpr char DS4_MODEL_SHAPE_NAME[] = "DeepSeek V4 Flash";
-inline constexpr float DS4_RMS_EPS = 1.0e-6F;
+inline constexpr char DS4_MODEL_SHAPE_NAME[] = "DeepSeek V4.1 Flash";
+inline constexpr float DS4_RMS_EPS = 1.0e-20F;
 inline constexpr float DS4_HC_EPS = 1.0e-6F;
 inline constexpr float DS4_EXPERT_WEIGHT_SCALE = 1.5F;
 inline constexpr float DS4_SWIGLU_CLAMP_EXP = 10.0F;
@@ -71,6 +72,12 @@ struct ds4_tensor {
     uint64_t bytes;
 };
 
+struct ds4_shard_view {
+    gufo::platform::PlatformFile fd;
+    gufo::platform::RawMappedFile mapping;
+    uint64_t size;
+};
+
 struct ds4_model {
     gufo::platform::PlatformFile fd;
     gufo::platform::RawMappedFile mapping;
@@ -84,6 +91,14 @@ struct ds4_model {
     uint64_t max_tensor_bytes;
     ds4_kv *kv;
     ds4_tensor *tensors;
+    /* Split GGUF (general split.count > 1): all shards are mapped back to
+     * back at 2 MiB-aligned slots of one flat view; tensor abs_offset values
+     * address that flat map.  Shard 0 is the file opened at `path`. */
+    uint32_t n_shards;
+    ds4_shard_view *shard_views;
+    uint64_t *shard_slots;
+    void *flat_map;
+    uint64_t flat_size;
 };
 
 struct ds4_layer_weights {
@@ -104,6 +119,8 @@ struct ds4_layer_weights {
     ds4_tensor *attn_compressor_gate;
     ds4_tensor *attn_compressor_norm;
     ds4_tensor *indexer_attn_q_b;
+    ds4_tensor *indexer_attn_k;
+    ds4_tensor *indexer_k_norm;
     ds4_tensor *indexer_proj;
     ds4_tensor *indexer_compressor_ape;
     ds4_tensor *indexer_compressor_kv;
@@ -114,6 +131,8 @@ struct ds4_layer_weights {
     ds4_tensor *hc_ffn_base;
     ds4_tensor *ffn_norm;
     ds4_tensor *ffn_gate_tid2eid;
+    ds4_tensor *engram_kv;
+    ds4_tensor *engram_gate;
     ds4_tensor *ffn_gate_inp;
     ds4_tensor *ffn_exp_probs_b;
     ds4_tensor *ffn_gate_exps;
@@ -131,8 +150,40 @@ struct ds4_weights {
     ds4_tensor *output_hc_scale;
     ds4_tensor *output_norm;
     ds4_tensor *output;
+    ds4_tensor *per_layer_token_embd;
     ds4_layer_weights layer[DS4_MAX_LAYER];
 };
+
+/* V4.1 source-layer tables, resolved from GGUF metadata at load time. */
+inline constexpr uint32_t DS4_PLE_MAX_LAYERS = 8;
+inline constexpr uint32_t DS4_PLE_MAX_COLS = 64;
+inline constexpr uint32_t DS4_PLE_MAX_TOTAL_COLS = 128;
+inline constexpr uint32_t DS4_PLE_EMBD = 256;
+inline constexpr int64_t DS4_PLE_DEAD = -1;
+
+struct ds4_ple_state {
+    int present;
+    uint32_t n_modules;
+    uint32_t ngram;
+    uint32_t heads_per_ngram;
+    uint32_t cols_per_module;
+    uint32_t total_cols;
+    uint32_t layers[DS4_PLE_MAX_LAYERS];
+    uint64_t multipliers[DS4_PLE_MAX_LAYERS * 8];
+    uint32_t offsets[DS4_PLE_MAX_TOTAL_COLS];
+    uint32_t primes[DS4_PLE_MAX_TOTAL_COLS];
+    std::vector<int32_t> token_map; /* vocab-sized class ids */
+    int64_t pad_class;             /* token_map[engram.pad_token_id] */
+    int64_t dead_token_id;         /* token_map[padding_token_id] */
+};
+
+extern ds4_ple_state g_ds4_ple;
+
+uint32_t ds4_layer_kv_source(uint32_t layer);
+uint32_t ds4_layer_topk_source(uint32_t layer);
+bool ds4_layer_is_kv_source(uint32_t layer);
+bool ds4_layer_is_topk_source(uint32_t layer);
+int ds4_ple_module_for_layer(uint32_t layer);
 
 using token_vec = ds4_tokens;
 

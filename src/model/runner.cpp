@@ -875,7 +875,7 @@ std::shared_ptr<ext::TextModelRunner> CreateDeepSeekTextRunner(
   std::uint32_t max_context = options.max_context;
   if (max_context == 0) {
     const std::uint64_t native =
-        reader->GetMetadataUint64("deepseek4.context_length").value_or(0);
+        reader->GetMetadataUint64("deepseek41.context_length").value_or(0);
     if (native < 2 || native > std::numeric_limits<std::uint32_t>::max()) {
       if (error)
         *error = "GGUF has no valid native context length; specify --context";
