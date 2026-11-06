@@ -2451,15 +2451,15 @@ static bool rocm_graph_upload_prompt_embeddings_hc(
     if (pos0 > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - pos0) return false;
     if (!tokens || n_tokens == 0) return false;
     return ds4_gpu_embed_tokens_hc_tensor(out_hc,
-                                           tokens,
-                                           model->map,
-                                           model->size,
-                                           weights->token_embd->abs_offset,
-                                           (uint32_t)weights->token_embd->dim[1],
-                                           n_tokens,
-                                           DS4_N_EMBD,
-                                           DS4_N_HC,
-                                           weights->token_embd->type) != 0;
+                                          tokens,
+                                          model->map,
+                                          model->size,
+                                          weights->token_embd->abs_offset,
+                                          (uint32_t)weights->token_embd->dim[1],
+                                          n_tokens,
+                                          DS4_N_EMBD,
+                                          DS4_N_HC,
+                                          weights->token_embd->type) != 0;
 }
 
 /* Encode the batched prefill attention half for one layer.  It mirrors the CPU
@@ -4960,6 +4960,20 @@ static bool rocm_graph_encode_layer_ffn_batch(
 }
 
 /* Encode one complete layer for prefill by chaining attention and FFN batches. */
+static void ds4_dbg_layer_state(uint32_t il, uint32_t nt, const char *tag,
+                                const ds4_gpu_tensor *t) {
+  if (!getenv("DS4_DEBUG_STATE") || il != 0u || !t || nt == 0u) return;
+  ds4_gpu_synchronize();
+  fprintf(stderr, "ds4: state[%s] L0 last", tag);
+  for (uint32_t hc = 0; hc < DS4_N_HC; ++hc) {
+    float v[4] = {0.f, 0.f, 0.f, 0.f};
+    const uint64_t off = ((uint64_t)(nt - 1u) * DS4_N_HC + hc) * DS4_N_EMBD;
+    if (ds4_gpu_readback_f32(t, off, 4, v))
+      fprintf(stderr, " hc%u:%.5f,%.5f,%.5f,%.5f", hc, v[0], v[1], v[2], v[3]);
+  }
+  fprintf(stderr, "\n");
+}
+
 static bool rocm_graph_encode_layer_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -4967,14 +4981,17 @@ static bool rocm_graph_encode_layer_batch(
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens) {
+    ds4_dbg_layer_state(il, n_tokens, "in ", g->batch_cur_hc);
     bool ok = rocm_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
     if (!ok) fprintf(stderr, "ds4: prefill layer %u attention failed\n", il);
     rocm_graph_probe_layer_tensor(g->batch_after_attn_hc,
                                   (uint64_t)n_tokens * 4ull * DS4_N_EMBD,
                                   "after attn", il);
+    ds4_dbg_layer_state(il, n_tokens, "attn", g->batch_after_attn_hc);
     const bool ok_ffn = ok && rocm_graph_encode_layer_ffn_batch(g, model, layer, il, pos0, n_tokens);
     if (ok && !ok_ffn) fprintf(stderr, "ds4: prefill layer %u ffn failed\n", il);
     ok = ok_ffn;
+    ds4_dbg_layer_state(il, n_tokens, "out", g->batch_next_hc);
     if (ok) {
         ds4_gpu_tensor *tmp = g->batch_cur_hc;
         g->batch_cur_hc = g->batch_next_hc;

@@ -58,7 +58,23 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
         embed_tokens_hc_q5_k_kernel<<<n_tokens, 256>>>(
             (float *)out_hc->ptr, (const int32_t *)tokens_t->ptr,
             (const block_q5_K *)wptr, n_vocab, n_tokens, n_embd, n_hc);
-        return hip_ok(hipGetLastError(), "embed tokens q5_k launch");
+        if (!hip_ok(hipGetLastError(), "embed tokens q5_k launch")) return 0;
+        if (getenv("DS4_ENGRAM_DEBUG") && n_tokens > 1) {
+            hipDeviceSynchronize();
+            const int32_t *tk = (const int32_t *)tokens_t->ptr;
+            int32_t h_tok[2] = {-1, -1};
+            float h_a[4] = {0}, h_b[4] = {0};
+            hipMemcpy(h_tok, tk, 2 * sizeof(int32_t), hipMemcpyDeviceToHost);
+            hipMemcpy(h_a, (const float *)out_hc->ptr + 1ull * n_embd,
+                      4 * sizeof(float), hipMemcpyDeviceToHost);
+            hipMemcpy(h_b, (const float *)out_hc->ptr + 1ull * n_hc * n_embd,
+                      4 * sizeof(float), hipMemcpyDeviceToHost);
+            fprintf(stderr, "ds4: embed dbg toks=%d,%d copymaj=%.6f,%.6f,%.6f,%.6f "
+                            "tokmaj=%.6f,%.6f,%.6f,%.6f\n",
+                    h_tok[0], h_tok[1], h_a[0], h_a[1], h_a[2], h_a[3],
+                    h_b[0], h_b[1], h_b[2], h_b[3]);
+        }
+        return 1;
     }
     uint64_t weight_bytes = 0;
     if (!hip_u64_mul3_checked(n_vocab, n_embd, sizeof(uint16_t), &weight_bytes) ||
