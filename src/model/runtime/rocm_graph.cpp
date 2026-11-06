@@ -1141,6 +1141,14 @@ static uint32_t rocm_graph_raw_span_for_batch(
     return (uint32_t)needed;
 }
 
+/* A/B diagnostic: drop every compressed-KV contribution from attention so
+ * the model runs pure sliding-window.  Used to isolate whether the
+ * constant-token loop originates in the compressed path or the core stack. */
+static bool ds4_no_comp_attn_env(void) {
+  static const int on = getenv("GUFO_DS4_NO_COMP_ATTN") ? 1 : 0;
+  return on == 1;
+}
+
 static uint32_t rocm_graph_raw_start_for_span(
         const ds4_gpu_graph *g,
         uint32_t               last_pos,
@@ -2112,6 +2120,13 @@ static bool rocm_graph_encode_decode_layer(
         comp_cache = g->layer_attn_comp_cache[rocm_graph_comp_src(il)];
     }
     GUFO_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("compressor_indexer");
+
+    if (ok && ds4_no_comp_attn_env()) {
+        n_comp = 0;
+        comp_cache = NULL;
+        comp_selected = NULL;
+        n_selected = 0;
+    }
 
     if (ok) {
         const uint32_t raw_start = rocm_graph_raw_start_for_span(g, pos, n_raw);
@@ -4092,6 +4107,7 @@ static bool rocm_graph_encode_layer_attention_batch(
                 }
             }
         }
+        if (ok && ds4_no_comp_attn_env()) n_comp = 0;
         if (ratio == 4) GUFO_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("indexer_setup");
 
         // A verifier block may cross the first sparse-indexer boundary. Rows
@@ -4315,7 +4331,8 @@ static bool rocm_graph_encode_layer_attention_batch(
                 const uint32_t pos = pos0 + t;
                 const uint32_t n_raw = rocm_graph_raw_span_for_batch(g, pos, 1);
                 const uint32_t raw_start = rocm_graph_raw_start_for_span(g, pos, n_raw);
-                const uint32_t cur_comp = comp_counts ? comp_counts[t] : 0u;
+                const uint32_t cur_comp =
+                    (comp_counts && !ds4_no_comp_attn_env()) ? comp_counts[t] : 0u;
                 const uint32_t cur_index = index_counts ? index_counts[t] : 0u;
                 uint32_t n_selected = 0;
 
@@ -4827,6 +4844,25 @@ static bool rocm_graph_encode_sessions_attention_batch(
     return ok;
 }
 
+/* Row statistics for one workspace tensor row (residual-branch bisect). */
+static void ds4_dbg_vec(const ds4_gpu_tensor *t, uint64_t off_elems,
+                        uint32_t n, const char *tag) {
+  if (!getenv("DS4_DEBUG_STATE") || !t) return;
+  static float buf[DS4_N_EMBD];
+  if (n > DS4_N_EMBD) n = DS4_N_EMBD;
+  if (!ds4_gpu_readback_f32(t, off_elems, n, buf)) { fprintf(stderr, "ds4: vec[%s] readback fail\n", tag); return; }
+  double s = 0.0; float mx = 0.f; uint32_t big = 0, nan = 0;
+  for (uint32_t i = 0; i < n; i++) {
+    const float a = fabsf(buf[i]);
+    if (!(buf[i] == buf[i])) { nan++; continue; }
+    if (a > mx) mx = a;
+    if (a > 100.f) big++;
+    s += (double)buf[i] * (double)buf[i];
+  }
+  fprintf(stderr, "ds4: vec[%s] rms=%.4f max=%.3f n>100=%u nan=%u\n",
+          tag, sqrt(s / n), mx, big, nan);
+}
+
 /* Encode the batched prefill FFN half: HC pre/norm, shared expert, routed
  * experts, sum, and HC post. */
 static bool rocm_graph_encode_layer_ffn_batch(
@@ -4837,6 +4873,17 @@ static bool rocm_graph_encode_layer_ffn_batch(
     uint32_t router_group_count = 0) {
   if (n_tokens == 0 || n_tokens > g->prefill_cap)
     return false;
+  if (getenv("DS4_DEBUG_STATE"))
+    fprintf(stderr, "ds4: qtt L%02u rt=%u ep=%u guE=%u/%u dnE=%u guS=%u/%u dnS=%u\n",
+            il,
+            layer->ffn_gate_inp ? layer->ffn_gate_inp->type : 999,
+            layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->type : 999,
+            layer->ffn_gate_exps ? layer->ffn_gate_exps->type : 999,
+            layer->ffn_up_exps ? layer->ffn_up_exps->type : 999,
+            layer->ffn_down_exps ? layer->ffn_down_exps->type : 999,
+            layer->ffn_gate_shexp ? layer->ffn_gate_shexp->type : 999,
+            layer->ffn_up_shexp ? layer->ffn_up_shexp->type : 999,
+            layer->ffn_down_shexp ? layer->ffn_down_shexp->type : 999);
   if (!tokens)
     tokens = g->prefill_tokens;
   if ((router_group_offsets != nullptr) != (router_group_count != 0u) ||
@@ -5128,6 +5175,13 @@ static bool rocm_graph_encode_layer_ffn_batch(
     rocm_graph_probe_layer_tensor(g->batch_shared_out,
                                   (uint64_t)n_tokens * DS4_N_EMBD,
                                   "shared out", il);
+    if (getenv("DS4_DEBUG_STATE") && il >= 9u && il <= 13u) {
+      const uint64_t last = (uint64_t)(n_tokens - 1u) * DS4_N_EMBD;
+      fprintf(stderr, "ds4: vec L%02u routed: ", il);
+      ds4_dbg_vec(g->batch_routed_out, last, DS4_N_EMBD, "ro");
+      fprintf(stderr, "ds4: vec L%02u shared: ", il);
+      ds4_dbg_vec(g->batch_shared_out, last, DS4_N_EMBD, "sh");
+    }
 
     const bool routed_sum_deferred = ds4_gpu_routed_sum_deferred() != 0;
     ds4_gpu_set_routed_defer_sum(0);
@@ -5169,9 +5223,12 @@ static bool rocm_graph_encode_layer_ffn_batch(
 /* Encode one complete layer for prefill by chaining attention and FFN batches. */
 static void ds4_dbg_layer_state(uint32_t il, uint32_t nt, const char *tag,
                                 const ds4_gpu_tensor *t) {
-  if (!getenv("DS4_DEBUG_STATE") || il != 0u || !t || nt == 0u) return;
+  if (!getenv("DS4_DEBUG_STATE") ||
+      (il != 0u && il != 1u && il != 14u && il != 19u && il != 39u) ||
+      !t || nt == 0u)
+    return;
   ds4_gpu_synchronize();
-  fprintf(stderr, "ds4: state[%s] L0 last", tag);
+  fprintf(stderr, "ds4: state[%s] L%u last", tag, il);
   for (uint32_t hc = 0; hc < DS4_N_HC; ++hc) {
     float v[4] = {0.f, 0.f, 0.f, 0.f};
     const uint64_t off = ((uint64_t)(nt - 1u) * DS4_N_HC + hc) * DS4_N_EMBD;
@@ -5179,6 +5236,44 @@ static void ds4_dbg_layer_state(uint32_t il, uint32_t nt, const char *tag,
       fprintf(stderr, " hc%u:%.5f,%.5f,%.5f,%.5f", hc, v[0], v[1], v[2], v[3]);
   }
   fprintf(stderr, "\n");
+}
+
+/* Per-layer stream RMS for the last token: growth-curve bisect for the
+ * residual explosion (healthy models keep this in single/double digits). */
+static void ds4_dbg_layer_rms(uint32_t il, uint32_t nt,
+                              const ds4_gpu_tensor *t, const char *sfx) {
+  if (!getenv("DS4_DEBUG_STATE") || !t || nt == 0u) return;
+  static float buf[DS4_N_EMBD];
+  fprintf(stderr, "ds4: rms L%02u%s", il, sfx);
+  for (uint32_t hc = 0; hc < DS4_N_HC; ++hc) {
+    const uint64_t off = ((uint64_t)(nt - 1u) * DS4_N_HC + hc) * DS4_N_EMBD;
+    if (!ds4_gpu_readback_f32(t, off, DS4_N_EMBD, buf)) { fprintf(stderr, " ?"); continue; }
+    double s = 0.0;
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
+      if (!(buf[i] == buf[i])) bad++;
+      s += (double)buf[i] * (double)buf[i];
+    }
+    fprintf(stderr, " %u:%.3f%s", hc, sqrt(s / DS4_N_EMBD), bad ? "!NaN" : "");
+  }
+  fprintf(stderr, "\n");
+}
+
+/* Distribution probe over a host-side logits row: identifies whether the
+ * constant-token loop is a saturated argmax (broken projection/mix) or a
+ * flat distribution (missing signal). */
+static void ds4_dbg_logits_h(const float *h, const char *tag, uint32_t pos) {
+  if (!getenv("DS4_DEBUG_STATE") || !h) return;
+  int a = -1, b = -1, big = 0;
+  float av = -1e30f, bv = -1e30f;
+  for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    const float v = h[i];
+    if (v > 10.0f) big++;
+    if (v > av) { bv = av; b = a; av = v; a = (int)i; }
+    else if (v > bv) { bv = v; b = (int)i; }
+  }
+  fprintf(stderr, "ds4: logits[%s p=%u] top1=%d(%.3f) top2=%d(%.3f) n>10=%d\n",
+          tag, pos, a, av, b, bv, big);
 }
 
 static bool rocm_graph_encode_layer_batch(
@@ -5189,12 +5284,15 @@ static bool rocm_graph_encode_layer_batch(
         uint32_t                pos0,
         uint32_t                n_tokens) {
     ds4_dbg_layer_state(il, n_tokens, "in ", g->batch_cur_hc);
+    ds4_dbg_layer_rms(il, n_tokens, g->batch_cur_hc, "");
     bool ok = rocm_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
     if (!ok) fprintf(stderr, "ds4: prefill layer %u attention failed\n", il);
     rocm_graph_probe_layer_tensor(g->batch_after_attn_hc,
                                   (uint64_t)n_tokens * 4ull * DS4_N_EMBD,
                                   "after attn", il);
     ds4_dbg_layer_state(il, n_tokens, "attn", g->batch_after_attn_hc);
+    if (il >= 9u && il <= 13u)
+        ds4_dbg_layer_rms(il, n_tokens, g->batch_after_attn_hc, "a");
     const bool ok_ffn = ok && rocm_graph_encode_layer_ffn_batch(g, model, layer, il, pos0, n_tokens);
     if (ok && !ok_ffn) fprintf(stderr, "ds4: prefill layer %u ffn failed\n", il);
     ok = ok_ffn;
@@ -5231,6 +5329,7 @@ static bool rocm_graph_eval_token_raw_swa(
 
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+        if (ok) ds4_dbg_logits_h(logits, "decode", pos);
     }
     const double t_read = profile ? ds4_now_seconds() : 0.0;
     if (profile) {
@@ -5407,6 +5506,7 @@ static bool rocm_graph_prefill_layer_major(
                               &fi);
         }
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+        if (ok) ds4_dbg_logits_h(logits, "prefill", start + n_tokens - 1u);
     }
     if (profile) {
         const double t_read = ds4_now_seconds();

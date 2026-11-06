@@ -35,14 +35,15 @@ static __device__ __forceinline__ void ds4_iq_deq8(uint32_t type,
         const block_iq2_xxs *b = (const block_iq2_xxs *)blk;
         const float d = __half2float(b->d);
         const int ib = g >> 2, l = g & 3;
-        /* Mirror dequantize_row_iq2_xxs: two little-endian words per 32-elem
-         * sub-block — qs[0..15] grid codes, qs[16..31] signs + scale. */
-        const uint32_t aux0 = ((const uint32_t *)b->qs)[ib];
-        const uint32_t aux1 = ((const uint32_t *)(b->qs + 16))[ib];
+        /* Mirror dequantize_row_iq2_xxs: each 32-element block is two
+         * CONSECUTIVE little-endian words — aux0 holds the four grid-code
+         * bytes aux8[l], aux1 holds the scale nibble (bits 28..31) plus the
+         * four 7-bit sign indices (bits 7*l). */
+        const uint32_t aux0 = ((const uint32_t *)b->qs)[2 * ib];
+        const uint32_t aux1 = ((const uint32_t *)b->qs)[2 * ib + 1];
         const float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;
         const uint64_t grid = iq2xxs_grid[(aux0 >> (8 * l)) & 0xffu];
-        const uint8_t signs =
-            ksigns_iq2xs[((aux1 >> (7 * l)) & 0x7fu) | 0x80u];
+        const uint8_t signs = ksigns_iq2xs[(aux1 >> (7 * l)) & 0x7fu];
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             const float e = (float)((grid >> (8 * j)) & 0xffu);
@@ -52,12 +53,13 @@ static __device__ __forceinline__ void ds4_iq_deq8(uint32_t type,
         const block_iq2_xs *b = (const block_iq2_xs *)blk;
         const float d = __half2float(b->d);
         const int ib = g >> 2, l = g & 3;
-        /* Mirror dequantize_row_iq2_xs: four LE 16-bit codes per 32-elem
-         * sub-block; the 4-bit sub-scale lives in scales[ib/2] nibble ib%2. */
-        const uint16_t code = ((const uint16_t *)b->qs)[4 * ib + l];
-        const uint16_t sc16 = ((const uint16_t *)b->scales)[ib >> 1];
+        /* Mirror dequantize_row_iq2_xs: qs[4*ib+l] = grid index (low 9 bits)
+         * | sign-table index (bits 9..15); scales[ib] carries TWO 4-bit
+         * sub-block scales — low nibble for l<2, high nibble for l>=2. */
+        const uint16_t code = b->qs[4 * ib + l];
+        const uint8_t scb = b->scales[ib];
         const float db =
-            d * (0.5f + (float)((sc16 >> (4 * (ib & 1))) & 0xf)) * 0.25f;
+            d * (0.5f + (float)(l < 2 ? (scb & 0xfu) : (scb >> 4))) * 0.25f;
         const uint64_t grid = iq2xs_grid[code & 511u];
         const uint8_t signs = ksigns_iq2xs[code >> 9];
 #pragma unroll
