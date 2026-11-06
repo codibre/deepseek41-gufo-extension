@@ -412,6 +412,9 @@ __device__ static float dsv4_e2m1fn_dequant_dev(float x) {
 
 __device__ static float model_ape_value_dev(const void *base, uint64_t offset, uint32_t type,
                                             uint32_t width, uint32_t row, uint32_t col) {
+    /* offset 0 is the no-APE sentinel (DeepSeek V4.1 dropped the compressor
+     * APE table): GGUF tensor data never starts at byte 0 of the file. */
+    if (offset == 0ull) return 0.0f;
     const char *p = (const char *)base + offset;
     if (type == 1u) return __half2float(((const __half *)p)[(uint64_t)row * width + col]);
     if (type == 8u) {

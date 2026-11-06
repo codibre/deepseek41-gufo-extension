@@ -3,6 +3,8 @@
 // Included from ds4_rocm.hip.cpp before more specialized modules; these helpers are
 // intentionally kept static in the single translation unit.
 
+#include "../mmq/ggml-common.h"
+
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = v;
@@ -34,6 +36,71 @@ __global__ static void embed_tokens_hc_kernel(
     uint32_t tok = tok_i < 0 ? 0u : (uint32_t)tok_i;
     if (tok >= n_vocab) tok = 0;
     out[gid] = __half2float(w[(uint64_t)tok * n_embd + d]);
+}
+
+/* Q5_K token embedding: dequantize one row in-register and replicate it into
+ * all HC sections.  Weights stay as-is (no materialized F32 copy). */
+__device__ static inline void q5k_scale_min_at(int j, const uint8_t *q,
+                                               uint8_t *d, uint8_t *m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (uint8_t)((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+        *m = (uint8_t)((q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4));
+    }
+}
+
+__device__ static inline float q5k_elem_at(const block_q5_K *b, int k) {
+    const int jb = k >> 6;            /* 64-elem qh bit-pair group */
+    const int r = k & 63;             /* position within that group */
+    uint8_t sc, m;
+    q5k_scale_min_at(k >> 5, b->scales, &sc, &m);   /* 32-elem scale pair */
+    const float d1 = __half2float(b->data.d) * (float)sc;
+    const float m1 = __half2float(b->data.dmin) * (float)m;
+    const int lo = (r < 32);
+    const int qoff = jb * 32 + (lo ? r : r - 32);
+    const int nib = lo ? (b->qs[qoff] & 0xF) : (b->qs[qoff] >> 4);
+    const int extra = (b->qh[qoff % 32] & (1 << (2 * jb + (lo ? 0 : 1)))) ? 16 : 0;
+    return d1 * (float)(nib + extra) - m1;
+}
+
+__device__ static inline void embed_q5_k_row(float *out,
+                                             const block_q5_K *row,
+                                             uint32_t n_embd,
+                                             uint32_t n_hc) {
+    for (uint32_t base = threadIdx.x * 32u; base < n_embd;
+         base += blockDim.x * 32u) {
+        const block_q5_K *b = row + base / QK_K;
+        const int koff = (int)(base & (QK_K - 1u));   /* 32-chunks never straddle blocks */
+        for (int k = 0; k < 32; k++) {
+            const float v = q5k_elem_at(b, koff + k);
+            for (uint32_t h = 0; h < n_hc; h++) out[h * n_embd + base + k] = v;
+        }
+    }
+}
+
+__global__ static void embed_token_hc_q5_k_kernel(
+        float *out, uint32_t token, const block_q5_K *w,
+        uint32_t n_embd, uint32_t n_hc) {
+    embed_q5_k_row(out, w + (uint64_t)token * (n_embd / QK_K), n_embd, n_hc);
+}
+
+__global__ static void embed_tokens_hc_q5_k_kernel(
+        float *out,
+        const int32_t *tokens,
+        const block_q5_K *w,
+        uint32_t n_vocab,
+        uint32_t n_tokens,
+        uint32_t n_embd,
+        uint32_t n_hc) {
+    const uint32_t t = blockIdx.x;
+    if (t >= n_tokens) return;
+    int32_t tok_i = tokens[t];
+    uint32_t tok = tok_i < 0 ? 0u : (uint32_t)tok_i;
+    if (tok >= n_vocab) tok = 0;
+    embed_q5_k_row(out + (uint64_t)t * n_hc * n_embd,
+                   w + (uint64_t)tok * (n_embd / QK_K), n_embd, n_hc);
 }
 
 __device__ static float warp_sum_f32(float v);
@@ -583,6 +650,38 @@ __global__ static void matmul_f32_kernel(
     const float *xr = x + tok * in_dim;
     for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
         sum += wr[i] * xr[i];
+    }
+
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
+}
+
+/* BF16-weight matmul against F32 activations.  Weights are read AS IS from
+ * the GGUF mapping and widened to float in registers (bf16 is the upper half
+ * of f32, so the conversion is exact); no converted weight copy is ever
+ * materialized on the device. */
+__global__ static void matmul_bf16_kernel(
+        float *out,
+        const uint16_t *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok) {
+    uint64_t row = (uint64_t)blockIdx.x;
+    uint64_t tok = (uint64_t)blockIdx.y;
+    if (row >= out_dim || tok >= n_tok) return;
+
+    float sum = 0.0f;
+    const uint16_t *wr = w + row * in_dim;
+    const float *xr = x + tok * in_dim;
+    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        sum += __uint_as_float(((uint32_t)wr[i]) << 16) * xr[i];
     }
 
     __shared__ float partial[256];

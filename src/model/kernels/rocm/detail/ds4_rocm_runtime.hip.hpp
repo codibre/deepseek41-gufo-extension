@@ -75,7 +75,7 @@ static int g_rocm_mmq_ready;
 #include <gufo/ext/experimental/snapshot_transfer.hpp>
 #endif
 enum {
-    DS4_ROCM_N_EXPERT = 256u,
+    DS4_ROCM_N_EXPERT = 192u,  /* V4.1-Flash: ffn_gate_exps dim[2] */
     DS4_ROCM_N_EXPERT_USED = 6u,
     DS4_ROCM_COMPRESSOR_MAX_RATIO = 128u
 };
@@ -108,6 +108,12 @@ struct hip_q8_f16_transpose_range {
 };
 
 static std::vector<hip_model_range> g_model_ranges;
+
+/* V4.1 ships compressor/router/indexer weights in BF16.  The kernel tier is
+ * F16-native, so at load time each BF16 tensor is converted once into a
+ * device F16 copy registered here; hip_model_range_ptr then serves the copy
+ * for that exact (mapping, offset, bytes), mirroring how llama.cpp converts
+ * BF16 weights to F16 on backends without native BF16 math. */
 static std::vector<void*> g_model_allocations;
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
 
@@ -787,6 +793,25 @@ static const char *hip_model_range_ptr_from_fd(
             (wait && !g_model_uploader->Finish(&error))) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX "split model upload failed for %s: %s\n",
                     what ? what : "weights", error.c_str());
+            {
+                uint64_t lo = 0;
+                for (const gufo::core::GgufMappedRegion &rg : g_model_shard_regions) {
+                    const char *rb = static_cast<const char *>(rg.data);
+                    const char *se = static_cast<const char *>(model_map) + offset;
+                    if (se >= rb && se < rb + rg.size) {
+                        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                                "  span off=%llu bytes=%llu region[%llu..%llu) "
+                                "local=%llu local_room=%llu\n",
+                                (unsigned long long)offset, (unsigned long long)bytes,
+                                (unsigned long long)(rb - (const char *)model_map),
+                                (unsigned long long)(rb - (const char *)model_map + rg.size),
+                                (unsigned long long)(se - rb),
+                                (unsigned long long)(rg.size - (se - rb)));
+                        (void)lo;
+                        break;
+                    }
+                }
+            }
             return NULL;
         }
         g_model_ranges.push_back({model_map, offset, bytes, dev});
@@ -1044,6 +1069,73 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 }
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
+/* Debug probe: synchronize and report the first device error, clearing the
+ * sticky flag so the caller can tell sync faults from argument rejections. */
+extern "C" int ds4_gpu_probe_sync(const char *what) {
+    const hipError_t e = hipDeviceSynchronize();
+    if (e != hipSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "probe sync after %s: %s\n",
+                what ? what : "?", hipGetErrorString(e));
+        (void)hipGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
+/* Debug: count non-finite floats and record the first offending element. */
+static __global__ void ds4_finite_scan_kernel(const float *x, uint64_t n,
+                                       unsigned long long *count,
+                                       unsigned long long *first) {
+    const uint64_t stride = (uint64_t)blockDim.x * gridDim.x;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += stride) {
+        if (!isfinite(x[i])) {
+            atomicAdd(count, 1ull);
+            atomicMin(first, (unsigned long long)i);
+        }
+    }
+}
+
+extern "C" int ds4_gpu_probe_nan(const ds4_gpu_tensor *t, uint64_t elems,
+                                 const char *tag, unsigned long long *count,
+                                 unsigned long long *first_idx) {
+    static unsigned long long *d_stat = NULL;
+    if (!t || !t->ptr || !count || !first_idx) return 0;
+    if (!d_stat &&
+        hipMalloc((void **)&d_stat, 2 * sizeof(unsigned long long)) != hipSuccess)
+        return 0;
+    unsigned long long h[2];
+    h[0] = 0ull;
+    h[1] = ~0ull;
+    if (hipMemcpy(d_stat, h, 2 * sizeof(unsigned long long),
+                  hipMemcpyHostToDevice) != hipSuccess)
+        return 0;
+    const uint32_t blocks = (uint32_t)(elems > 262144ull ? 256u : 64u);
+    ds4_finite_scan_kernel<<<blocks, 256>>>((const float *)t->ptr, elems, d_stat,
+                                     d_stat + 1);
+    if (hipGetLastError() != hipSuccess ||
+        hipDeviceSynchronize() != hipSuccess ||
+        hipMemcpy(h, d_stat, 2 * sizeof(unsigned long long),
+                  hipMemcpyDeviceToHost) != hipSuccess) {
+        (void)hipGetLastError();
+        return 0;
+    }
+    *count = h[0];
+    *first_idx = h[1];
+    if (h[0])
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "NAN %s: %llu/%llu bad first=%llu\n",
+                tag ? tag : "?", h[0], (unsigned long long)elems, h[1]);
+    return 1;
+}
+
+extern "C" int ds4_gpu_readback_f32(const ds4_gpu_tensor *t, uint64_t off,
+                                    uint64_t n, float *dst) {
+    if (!t || !t->ptr || !dst) return 0;
+    return hip_ok(hipMemcpy(dst, (const float *)t->ptr + off,
+                            n * sizeof(float), hipMemcpyDeviceToHost),
+                  "readback f32");
+}
+
 extern "C" int ds4_gpu_end_commands(void) {
     return hip_ok(hipDeviceSynchronize(), "end commands");
 }
@@ -1086,6 +1178,41 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
      * envelope before the precise tensor-span cache gets a chance to run.
      */
     return 1;
+}
+
+/* One element per thread; safe with dst == src (in place). */
+__global__ void ds4_bf16_to_f16_kernel(uint16_t *__restrict__ dst,
+                                       const uint16_t *__restrict__ src,
+                                       unsigned long long n) {
+    unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+    for (; i < n; i += stride) {
+        unsigned int bits = ((unsigned int)src[i]) << 16;
+        float f;
+        memcpy(&f, &bits, sizeof(f));
+        __half h = __float2half(f);
+        unsigned short hv;
+        memcpy(&hv, &h, sizeof(hv));
+        dst[i] = hv;
+    }
+}
+
+extern "C" int ds4_gpu_materialize_bf16_as_f16(const void *model_map,
+                                               uint64_t offset,
+                                               uint64_t n_elems) {
+    /* Rewrite the resident BF16 span as F16 IN PLACE: same 2-byte footprint,
+     * zero extra device allocations (duplicating weights defeats GGUF). */
+    if (!model_map || n_elems == 0u) return 0;
+    const uint64_t bytes = n_elems * 2ull;
+    if (hipDeviceSynchronize() != hipSuccess) return 0;
+    const char *dev =
+        hip_model_range_ptr(model_map, offset, bytes, "bf16 in-place");
+    if (!dev) return 0;
+    const unsigned blocks = (unsigned)((n_elems + 511ull) / 512ull);
+    ds4_bf16_to_f16_kernel<<<blocks == 0u ? 1u : blocks, 512>>>(
+        (uint16_t *)const_cast<char *>(dev), (const uint16_t *)dev,
+        (unsigned long long)n_elems);
+    return hip_ok(hipGetLastError(), "bf16->f16 in-place launch");
 }
 
 extern "C" int ds4_gpu_set_model_fd(gufo::platform::PlatformFile fd) {

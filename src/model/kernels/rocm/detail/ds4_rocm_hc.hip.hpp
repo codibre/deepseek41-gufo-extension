@@ -440,6 +440,28 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
     }
 }
 
+/* Standalone F32 -> Q8_0 activation quantizer (one block per row, one thread
+ * per 32-elem block).  Used when the fused decode kernel's register-resident
+ * form does not fit the embedding width (e.g. V4.1 n_embd 5120 spills).
+ * Mirrors quantize_q8_0_cols256 semantics exactly. */
+__global__ static void q8_0_act_quantize_kernel(const float *x, int8_t *q8,
+                                                float *scales,
+                                                uint32_t n_rows,
+                                                uint32_t n_embd) {
+    const uint32_t row = blockIdx.x;
+    if (row >= n_rows) return;
+    const float *xr = x + (uint64_t)row * n_embd;
+    const uint32_t blocks = n_embd / 32u;
+    for (uint32_t b = threadIdx.x; b < blocks; b += blockDim.x) {
+        const float *xb = xr + (uint64_t)b * 32u;
+        float amax = 0.0f;
+        for (uint32_t i = 0; i < 32u; i++) amax = fmaxf(amax, fabsf(xb[i]));
+        scales[(uint64_t)row * blocks + b] = q8_0_scale(amax);
+        int8_t *qb = q8 + (uint64_t)row * n_embd + (uint64_t)b * 32u;
+        for (uint32_t i = 0; i < 32u; i++) qb[i] = q8_0_code(xb[i], amax);
+    }
+}
+
 /* Fuse HC RMS scaling, mix projection, Sinkhorn split and weighted sum.
  * Each thread retains its columns from all four raw F32 streams, so the final
  * weighted sum needs no second read of the input. Projection weights stay in

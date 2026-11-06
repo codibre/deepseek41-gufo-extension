@@ -419,6 +419,7 @@ typedef struct {
     int q4k_path;
     int iq2_path;
     int q2k_path;
+    int iq_any_path;
     uint64_t gate_bytes;
     uint64_t down_bytes;
 } routed_moe_launch_plan;
@@ -472,7 +473,19 @@ static int routed_moe_build_plan(
     plan->q4k_path = (gate_type == 12u && down_type == 12u);
     plan->iq2_path = (gate_type == 16u && down_type == 10u);
     plan->q2k_path = (gate_type == 10u && down_type == 10u);
-    if (!plan->q4k_path && !plan->iq2_path && !plan->q2k_path) return 0;
+    /* V4.1 GSQ picks the expert quant per tensor: iq2_xxs, iq2_xs and iq1_m
+     * appear (in any pairing) where V4 Flash used fixed q4_k/q2_k/q8_0 slabs.
+     * Those combinations take the generic in-register-dequant route. */
+    plan->iq_any_path =
+        (gate_type == 16u || gate_type == 17u || gate_type == 29u) &&
+        (down_type == 16u || down_type == 17u || down_type == 29u);
+    if (!plan->q4k_path && !plan->iq2_path && !plan->q2k_path &&
+        !plan->iq_any_path) {
+      fprintf(stderr,
+              "ds4: routed MoE has no kernel route for gate=%u down=%u\n",
+              gate_type, down_type);
+      return 0;
+    }
     if (!hip_u64_mul_checked(n_total_expert, gate_expert_bytes,
                              &plan->gate_bytes) ||
         !hip_u64_mul_checked(n_total_expert, down_expert_bytes,
@@ -517,6 +530,26 @@ static int routed_moe_launch(
       hip_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
   if (!gate_w || !up_w || !down_w)
     return 0;
+
+  if (plan.iq_any_path) {
+    /* Generic IQ-family route: the weights stay exactly as the GGUF stored
+     * them and the fp32 activations are dotted against in-register
+     * dequantized groups — no staging copies anywhere. */
+    const uint32_t pair_count = n_tokens * n_expert;
+    const unsigned iq_threads = 256u;
+    dim3 iq_gate_up((expert_mid_dim + 7u) / 8u, pair_count, 1u);
+    moe_gate_up_mid_iq_kernel<<<iq_gate_up, iq_threads, 0, (hipStream_t)0>>>(
+        (float*)mid->ptr, gate_w, up_w, (const float*)x->ptr,
+        (const int32_t*)selected->ptr, (const float*)weights->ptr,
+        gate_expert_bytes, gate_row_bytes, gate_type, expert_in_dim,
+        expert_mid_dim, n_expert, clamp);
+    dim3 iq_down((out_dim + 7u) / 8u, n_tokens, 1u);
+    moe_down_sum_iq_kernel<<<iq_down, iq_threads, 0, (hipStream_t)0>>>(
+        (float*)out->ptr, down_w, (const float*)mid->ptr,
+        (const int32_t*)selected->ptr, down_expert_bytes, down_row_bytes,
+        down_type, expert_mid_dim, out_dim, n_expert);
+    return hip_ok(hipGetLastError(), "routed_moe generic iq route launch");
+  }
 
   int ok = 1;
   const uint32_t xq_blocks = expert_in_dim / ROCM_QK_K;

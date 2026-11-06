@@ -1,3 +1,4 @@
+#include "../mmq/ggml-common.h"
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 #include <type_traits>
 #include <rocwmma/rocwmma.hpp>
@@ -1945,18 +1946,41 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
   if (!wptr)
     return 0;
   const float* w = (const float*)wptr;
-  if (g_hipblas_ready && n_tok > 1) {
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    hipblasStatus_t st = hipblasSgemm(
-        g_hipblas, HIPBLAS_OP_T, HIPBLAS_OP_N, (int)out_dim, (int)n_tok,
-        (int)in_dim, &alpha, w, (int)in_dim, (const float*)x->ptr, (int)in_dim,
-        &beta, (float*)out->ptr, (int)out_dim);
-    return hipblas_ok(st, "f32 matmul");
-  }
+  fprintf(stderr,
+          "ds4: f32 matmul ok in=%llu out=%llu tok=%llu woff=%llu xptr=%p "
+          "xbytes=%llu obytes=%llu\n",
+          (unsigned long long)in_dim, (unsigned long long)out_dim,
+          (unsigned long long)n_tok, (unsigned long long)weight_offset,
+          x->ptr, (unsigned long long)x->bytes, (unsigned long long)out->bytes);
+  /* NOTE: hipblasSgemm silently produced NaN for these tiny-m tall-k
+   * projections on this ROCm build (status success, garbage C).  The scalar
+   * kernel below is exact and these GEMMs have out_dim <= 32 rows, so the
+   * BLAS tier buys nothing here. */
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
     matmul_f32_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return hip_ok(hipGetLastError(), "matmul_f32 launch");
+}
+
+extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+  if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0 ||
+      in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX)
+    return 0;
+  uint64_t weight_bytes = 0, x_bytes = 0, out_bytes = 0;
+  if (weight_offset > model_size ||
+      !hip_u64_mul3_checked(out_dim, in_dim, sizeof(uint16_t), &weight_bytes) ||
+      weight_bytes > model_size - weight_offset ||
+      !hip_u64_mul3_checked(n_tok, in_dim, sizeof(float), &x_bytes) ||
+      !hip_u64_mul3_checked(n_tok, out_dim, sizeof(float), &out_bytes) ||
+      x->bytes < x_bytes || out->bytes < out_bytes)
+    return 0;
+  const char* wptr =
+      hip_model_range_ptr(model_map, weight_offset, weight_bytes, "bf16");
+  if (!wptr)
+    return 0;
+    dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
+    matmul_bf16_kernel<<<grid, 256>>>((float *)out->ptr, (const uint16_t *)wptr,
+                                      (const float *)x->ptr, in_dim, out_dim, n_tok);
+    return hip_ok(hipGetLastError(), "matmul_bf16 launch");
 }
 
 /* F16-activation entry for callers that already hold narrowed rows; returns 0
@@ -1967,4 +1991,171 @@ extern "C" int ds4_gpu_matmul_f16_f16_input_tensor(ds4_gpu_tensor *out, const vo
                                            weight_offset, in_dim, out_dim,
                                            (const __half *)x_h->ptr,
                                            x_h->bytes, n_tok);
+}
+
+/* ===========================================================================
+ * V4.1 dense GEMV tier: Q8_1 and grouped-Q5_K projections.  Weights are read
+ * as-is from the model map; unpacking happens in registers (no converted
+ * weight copies).  Scalar-correct kernels — MMQ tiers can follow later.
+ * ========================================================================= */
+
+/* Q8_1 row: 36-byte blocks of {int8 qs[32]; float scale}. */
+__device__ static float matmul_q8_1_dot_block(const unsigned char *b,
+                                              const float *x) {
+    const float s = *(const float *)(b + 32);
+    float acc = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float4 xv = *(const float4 *)(x + i * 8);
+        const int q0 = (int) b[i * 8 + 0], q1 = (int) b[i * 8 + 1];
+        const int q2 = (int) b[i * 8 + 2], q3 = (int) b[i * 8 + 3];
+        const int q4 = (int) b[i * 8 + 4], q5 = (int) b[i * 8 + 5];
+        const int q6 = (int) b[i * 8 + 6], q7 = (int) b[i * 8 + 7];
+        acc += xv.x * (float) q0 + xv.y * (float) q1 + xv.z * (float) q2 +
+               xv.w * (float) q3;
+        const float4 xv2 = *(const float4 *)(x + i * 8 + 4);
+        acc += xv2.x * (float) q4 + xv2.y * (float) q5 + xv2.z * (float) q6 +
+               xv2.w * (float) q7;
+    }
+    return acc * s;
+}
+
+__global__ static void matmul_q8_1_rows_kernel(
+        float *out, const unsigned char *w, const float *x,
+        uint64_t row_bytes, uint32_t in_blocks, uint32_t in_dim,
+        uint32_t out_dim) {
+    const uint32_t row = blockIdx.x * blockDim.y + threadIdx.y;
+    const uint32_t tok = blockIdx.y;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + (uint64_t)row * row_bytes;
+    const float *xr = x + (uint64_t)tok * in_dim;
+    float acc = 0.0f;
+    for (uint32_t c = threadIdx.x; c < in_blocks; c += blockDim.x)
+        acc += matmul_q8_1_dot_block(wr + (uint64_t)c * 36u, xr + (uint64_t)c * 32u);
+    const MASK_T mask = static_cast<MASK_T>(0xffffffffffffffffull);
+    for (int o = 16; o > 0; o >>= 1)
+        acc += __shfl_down_sync(mask, acc, o);
+    if (threadIdx.x == 0u)
+        out[(uint64_t)tok * out_dim + row] = acc;
+}
+
+extern "C" int ds4_gpu_matmul_q8_1_tensor(
+    ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+    uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+    const ds4_gpu_tensor *x, uint32_t n_tok) {
+    if (!out || !model_map || !x || in_dim == 0u || out_dim == 0u ||
+        n_tok == 0u || (in_dim % 32u) != 0u || in_dim > UINT32_MAX ||
+        out_dim > UINT32_MAX || n_tok > 65535u) {
+        return 0;
+    }
+    const uint64_t in_blocks = in_dim / 32u;
+    uint64_t weight_bytes = 0;
+    if (!hip_u64_mul_checked(out_dim, in_blocks * 36u, &weight_bytes)) return 0;
+    const unsigned char *w = (const unsigned char *)hip_model_range_ptr(
+        model_map, weight_offset, weight_bytes, "matmul_q8_1");
+    if (!w) return 0;
+    if (!hip_tensor_has_f32(out, (uint64_t)n_tok * out_dim) ||
+        !hip_tensor_has_f32(x, (uint64_t)n_tok * in_dim)) {
+        return 0;
+    }
+    const dim3 block(32u, 8u);
+    const dim3 grid((unsigned)((out_dim + 7u) / 8u), n_tok);
+    matmul_q8_1_rows_kernel<<<grid, block, 0, (hipStream_t)0>>>(
+        (float *)out->ptr, w, (const float *)x->ptr, in_blocks * 36u,
+        (uint32_t)in_blocks, (uint32_t)in_dim, (uint32_t)out_dim);
+    return hip_ok(hipGetLastError(), "matmul_q8_1 launch");
+}
+
+/* Grouped output_a projection (V4.1): for each token t and group g,
+ * low[t, g*rank + r] = heads[t, g*group_dim + :] . W_a[r, :].  W is Q5_K.
+ * Mirrors llama.cpp deepseek41 wo_a (grouped mul_mat + concat, no sum). */
+__device__ static inline void matmul_q5k_scale_min(int j, const uint8_t *q,
+                                                   uint8_t *d, uint8_t *m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (uint8_t)((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+        *m = (uint8_t)((q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4));
+    }
+}
+
+__device__ static float matmul_q5k_dot_row(const block_q5_K *b,
+                                           const float *x) {
+    const uint8_t *ql = b->qs;
+    const uint8_t *qh = b->qh;
+    const float d = __half2float(b->data.d);
+    const float mn = __half2float(b->data.dmin);
+    float acc = 0.0f;
+    int is = 0;
+    uint8_t u1 = 1, u2 = 2;
+    for (int j = 0; j < QK_K; j += 64) {
+        uint8_t sc, m;
+        matmul_q5k_scale_min(is, b->scales, &sc, &m);
+        const float d1 = d * (float)sc, m1 = mn * (float)m;
+        matmul_q5k_scale_min(is + 1, b->scales, &sc, &m);
+        const float d2 = d * (float)sc, m2 = mn * (float)m;
+        for (int l = 0; l < 32; ++l)
+            acc += (d1 * (float)((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1) * x[j + l];
+        for (int l = 0; l < 32; ++l)
+            acc += (d2 * (float)((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - m2) * x[j + 32 + l];
+        ql += 32;
+        is += 2;
+        u1 <<= 2;
+        u2 <<= 2;
+    }
+    return acc;
+}
+
+__global__ static void attention_output_a_q5_k_kernel(
+        float *out, const char *wa, const float *heads, uint32_t rank,
+        uint32_t n_groups, uint32_t group_dim, uint32_t in_blocks) {
+    const uint32_t r = blockIdx.x * blockDim.y + threadIdx.y;  /* row < rank */
+    const uint32_t tg = blockIdx.y;                            /* t*n_groups+g */
+    if (r >= rank) return;
+    const uint32_t t = tg / n_groups;
+    const uint32_t g = tg % n_groups;
+    const block_q5_K *b =
+        (const block_q5_K *)(wa + (uint64_t)r * in_blocks * sizeof(block_q5_K));
+    const float *xr = heads + (uint64_t)t * n_groups * group_dim +
+                      (uint64_t)g * group_dim;
+    float acc = 0.0f;
+    for (uint32_t c = threadIdx.x; c < in_blocks; c += blockDim.x)
+        acc += matmul_q5k_dot_row(b + c, xr + (uint64_t)c * QK_K);
+    const MASK_T mask = static_cast<MASK_T>(0xffffffffffffffffull);
+    for (int o = 16; o > 0; o >>= 1)
+        acc += __shfl_down_sync(mask, acc, o);
+    if (threadIdx.x == 0u)
+        out[(uint64_t)tg * rank + r] = acc;
+}
+
+extern "C" int ds4_gpu_attention_output_a_q5_k_tensor(
+    ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+    uint64_t weight_offset, uint64_t group_dim, uint64_t rank,
+    uint32_t n_groups, const ds4_gpu_tensor *heads, uint32_t n_tok) {
+    if (!low || !model_map || !heads || rank == 0u || n_groups == 0u ||
+        n_tok == 0u || (group_dim % QK_K) != 0u || group_dim > UINT32_MAX ||
+        rank > UINT32_MAX || (uint64_t)n_tok * n_groups > 65535u) {
+        return 0;
+    }
+    const uint64_t in_blocks = group_dim / QK_K;
+    uint64_t weight_bytes = 0;
+    if (!hip_u64_mul_checked(rank, in_blocks * sizeof(block_q5_K),
+                             &weight_bytes)) {
+        return 0;
+    }
+    const char *wa = (const char *)hip_model_range_ptr(
+        model_map, weight_offset, weight_bytes, "output_a_q5k");
+    if (!wa) return 0;
+    if (!hip_tensor_has_f32(low, (uint64_t)n_tok * n_groups * rank) ||
+        !hip_tensor_has_f32(heads,
+                            (uint64_t)n_tok * n_groups * group_dim)) {
+        return 0;
+    }
+    const dim3 block(32u, 8u);
+    const dim3 grid((unsigned)((rank + 7u) / 8u), n_tok * n_groups);
+    attention_output_a_q5_k_kernel<<<grid, block, 0, (hipStream_t)0>>>(
+        (float *)low->ptr, wa, (const float *)heads->ptr, (uint32_t)rank,
+        n_groups, (uint32_t)group_dim, (uint32_t)in_blocks);
+    return hip_ok(hipGetLastError(), "output_a_q5k launch");
 }

@@ -89,11 +89,15 @@ struct block_iq2_xs {
 };
 static_assert(sizeof(block_iq2_xs) == 74);
 
+/* GGML canonical IQ1_M: grid low bits + high/shift bits + 3-bit scales
+ * (56 bytes per QK_K), matching kernels/rocm/mmq/ggml-common.h.  A previous
+ * 66-byte guess here desynced the down-projection span from the tensor. */
 struct block_iq1_m {
-    uint16_t d;
-    uint8_t  qs[QK_K / 4];
+    uint8_t  qs[QK_K / 8];
+    uint8_t  qh[QK_K / 16];
+    uint8_t  scales[QK_K / 32];
 };
-static_assert(sizeof(block_iq1_m) == 66);
+static_assert(sizeof(block_iq1_m) == QK_K / 8 + QK_K / 16 + QK_K / 32);
 
 /* =========================================================================
  * Shared Helpers, Allocation Guards, and Cursor Reads.
@@ -689,6 +693,14 @@ static void parse_shard_infos(ds4_model *m, ds4_cursor *c, uint64_t n_tensors,
         if (!cursor_string(c, &t.name)) ds4_die(c->error);
         if (!cursor_u32(c, &t.ndim)) ds4_die(c->error);
         if (t.ndim == 0 || t.ndim > DS4_MAX_DIMS) {
+            fprintf(stderr,
+                    "ds4: parse dir fail i=%llu pos=%llu name_len=%llu "
+                    "name=%.*s nd=%u n_tensors=%llu\n",
+                    (unsigned long long)i, (unsigned long long)c->pos,
+                    (unsigned long long)t.name.len,
+                    (int)(t.name.len < 40 ? t.name.len : 40),
+                    t.name.ptr ? t.name.ptr : "", t.ndim,
+                    (unsigned long long)n_tensors);
             ds4_die("tensor has an unsupported number of dimensions");
         }
         t.elements = 1;
@@ -786,7 +798,42 @@ static void model_open_split(ds4_model *m, const char *path, ds4_cursor *c,
             if (!cursor_u32(&sc, &type)) ds4_die(sc.error);
             if (!skip_value(&sc, type, 0)) ds4_die(sc.error);
         }
-        uint64_t data_pos = ds4_align_up(sc.pos, m->alignment);
+        /* GGUF data begins after the tensor INFO directory, not after the
+         * KV section: skip the directory with a probe cursor to learn the
+         * true data start before assigning abs offsets. */
+        uint64_t probe_dir_end = sc.pos;
+        {
+            ds4_cursor probe = sc;
+            for (uint64_t i = 0; i < shard_tensors; i++) {
+                ds4_str nm;
+                uint32_t nd = 0, ty = 0;
+                uint64_t rel = 0, dv = 0;
+                if (!cursor_string(&probe, &nm)) ds4_die(probe.error);
+                if (!cursor_u32(&probe, &nd)) ds4_die(probe.error);
+                if (nd == 0 || nd > DS4_MAX_DIMS) {
+                    fprintf(stderr,
+                            "ds4: probe dir fail k=%u i=%llu pos=%llu "
+                            "name_len=%llu nd=%u size=%llu\n",
+                            k, (unsigned long long)i,
+                            (unsigned long long)probe.pos,
+                            (unsigned long long)nm.len, nd,
+                            (unsigned long long)probe.size);
+                    ds4_die("tensor has an unsupported number of dimensions");
+                }
+                for (uint32_t dd = 0; dd < nd; dd++)
+                    if (!cursor_u64(&probe, &dv)) ds4_die(probe.error);
+                if (!cursor_u32(&probe, &ty)) ds4_die(probe.error);
+                if (!cursor_u64(&probe, &rel)) ds4_die(probe.error);
+            }
+            probe_dir_end = probe.pos;
+        }
+        /* NOTE: the real sc stays at the directory start for
+         * parse_shard_infos; only the probe cursor walked ahead. */
+        uint64_t data_pos = ds4_align_up(probe_dir_end, m->alignment);
+        fprintf(stderr, "ds4: shard %u dir_end=%llu data_pos=%llu tensors=%llu\n",
+                k, (unsigned long long)probe_dir_end,
+                (unsigned long long)data_pos,
+                (unsigned long long)shard_tensors);
         begin.push_back(tvec.size());
         slot.push_back(total);
         m->shard_slots[k] = total;
@@ -961,6 +1008,10 @@ static bool accelerator_cache_model_tensors(const ds4_model *m) {
             "%.3fs",
             (double)cached / 1073741824.0, t1 - t0);
     }
+    /* BF16 router/compressor/indexer weights stay BF16 in memory (tensor
+     * AS IS rule); matmul_bf16_kernel widens to F32 in registers at read
+     * time.  An earlier revision rewrote them to F16 in place inside the
+     * model map, which corrupted weights on every reload after the first. */
     return true;
 }
 

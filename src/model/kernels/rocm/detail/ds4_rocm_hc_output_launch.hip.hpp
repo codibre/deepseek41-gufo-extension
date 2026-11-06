@@ -190,6 +190,8 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         float                   norm_eps) {
     if (!out || !norm_out || !split || !mix || !residual_hc || !model_map ||
         n_embd == 0 || n_hc != 4) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "hc_split fused: entry null n_hc=%u\n", n_hc);
         return 0;
     }
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
@@ -221,17 +223,35 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
     float *q8_scale = NULL;
     if (norm_q8k && !norm_q8) return 0;
     if (norm_q8) {
-        constexpr uint32_t qcols = 16u;
-        if (n_embd != qcols * 256u || !hip_q8_0_act(norm_q8, n_rows, n_embd / 32u, &q8, &q8_scale) ||
+        if (n_embd % 32u != 0u) return 0;
+        const uint32_t qcols = n_embd / 256u;
+        if (!hip_q8_0_act(norm_q8, n_rows, n_embd / 32u, &q8, &q8_scale) ||
             (norm_q8k && !hip_tensor_has_elems2(norm_q8k, n_rows, n_embd / ROCM_QK_K,
                                                 sizeof(hip_block_q8_K)))) {
             return 0;
         }
-        hc_split_weighted_sum_norm_fused_kernel<qcols><<<(uint32_t)n_rows, 256>>>(
-                (float *)out->ptr, (float *)norm_out->ptr, q8, q8_scale,
-                norm_q8k ? (hip_block_q8_K *)norm_q8k->ptr : NULL, (float *)split->ptr,
-                (const float *)mix->ptr, (const float *)residual_hc->ptr, scale, base, norm_w,
-                n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
+        if (n_embd == 4096u) {
+            hc_split_weighted_sum_norm_fused_kernel<16u><<<(uint32_t)n_rows, 256>>>(
+                    (float *)out->ptr, (float *)norm_out->ptr, q8, q8_scale,
+                    norm_q8k ? (hip_block_q8_K *)norm_q8k->ptr : NULL, (float *)split->ptr,
+                    (const float *)mix->ptr, (const float *)residual_hc->ptr, scale, base, norm_w,
+                    n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
+        } else {
+            /* Wide rows (e.g. V4.1 n_embd 5120): fused kernel in F32-only
+             * form, then a standalone pass quantizes the normalized row. */
+            hc_split_weighted_sum_norm_fused_kernel<0u><<<(uint32_t)n_rows, 256>>>(
+                    (float *)out->ptr, (float *)norm_out->ptr, NULL, NULL, NULL,
+                    (float *)split->ptr, (const float *)mix->ptr,
+                    (const float *)residual_hc->ptr, scale, base, norm_w,
+                    n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
+            if (hip_ok(hipGetLastError(), "hc split weighted sum norm launch")) {
+                q8_0_act_quantize_kernel<<<(uint32_t)n_rows, 256>>>(
+                        (const float *)norm_out->ptr, q8, q8_scale,
+                        (uint32_t)n_rows, n_embd);
+                return hip_ok(hipGetLastError(), "q8_0 act quantize launch");
+            }
+            return 0;
+        }
         return hip_ok(hipGetLastError(), "hc split weighted sum norm quantize launch");
     }
     hc_split_weighted_sum_norm_fused_kernel<0><<<(uint32_t)n_rows, 256>>>(
@@ -258,18 +278,33 @@ extern "C" int ds4_gpu_output_hc_weights_tensor(
         uint64_t                base_offset,
         uint32_t                n_hc,
         float                   eps) {
-    if (!out || !pre || !model_map || n_hc == 0) return 0;
+    if (!out || !pre || !model_map || n_hc == 0) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "output_hc entry null: out=%p pre=%p map=%p n_hc=%u\n",
+                (void *)out, (const void *)pre, (const void *)model_map, n_hc);
+        return 0;
+    }
     const uint64_t row_bytes = (uint64_t)n_hc * sizeof(float);
     if (row_bytes == 0 || out->bytes < row_bytes || out->bytes % row_bytes != 0 ||
         pre->bytes < out->bytes ||
         scale_offset > model_size || sizeof(float) > model_size - scale_offset ||
         base_offset > model_size || row_bytes > model_size - base_offset) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "output_hc entry bounds: out=%llu pre=%llu row=%llu size=%llu\n",
+                (unsigned long long)out->bytes, (unsigned long long)pre->bytes,
+                (unsigned long long)row_bytes, (unsigned long long)model_size);
         return 0;
     }
     const uint64_t n_tokens = out->bytes / row_bytes;
     const float *scale = (const float *)hip_model_range_ptr(model_map, scale_offset, sizeof(float), "output_hc_scale");
     const float *base = (const float *)hip_model_range_ptr(model_map, base_offset, row_bytes, "output_hc_base");
-    if (!scale || !base) return 0;
+    if (!scale || !base) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "output_hc scale/base null: scale=%p base=%p off(s=%llu b=%llu)\n",
+                (const void *)scale, (const void *)base,
+                (unsigned long long)scale_offset, (unsigned long long)base_offset);
+        return 0;
+    }
     uint64_t n = n_tokens * n_hc;
     output_hc_weights_kernel<<<(n + 255) / 256, 256>>>(
             (float *)out->ptr,
