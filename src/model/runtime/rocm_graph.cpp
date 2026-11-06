@@ -1368,27 +1368,29 @@ static void rocm_engram_hash_rows(const std::vector<int32_t> &hist,
   out.resize((size_t)n * cols);
   for (size_t i = 0; i < n; ++i) {
     const uint32_t pos = start + (uint32_t)i;
-    int32_t toks[8];
+    // Mirror llama.cpp engram_hash: rolling folds one n-gram order per step
+    // and each order's head group uses the rolling accumulated so far, all in
+    // uint64 arithmetic (multipliers are 64-bit).
+    uint64_t toks[8];
     bool blocked = false;
-    toks[0] = rocm_engram_class_of(p, hist[pos]);
-    blocked = toks[0] == (int32_t)DS4_PLE_DEAD;
-    if (blocked)
-      toks[0] = p.pad_class;
-    uint32_t rh = (uint32_t)toks[0] * (uint32_t)p.multipliers[e * 8u + 0u];
+    int32_t c0 = rocm_engram_class_of(p, hist[pos]);
+    blocked = c0 == (int32_t)DS4_PLE_DEAD;
+    toks[0] = (uint64_t)(uint32_t)(blocked ? p.pad_class : c0);
     for (uint32_t s = 1; s < ng && s < 8u; ++s) {
       int32_t c = pos < s ? (int32_t)DS4_PLE_DEAD
                           : rocm_engram_class_of(p, hist[pos - s]);
       blocked = blocked || c == (int32_t)DS4_PLE_DEAD;
-      toks[s] = blocked ? p.pad_class : c;
-      rh ^= (uint32_t)toks[s] * (uint32_t)p.multipliers[e * 8u + s];
+      toks[s] = (uint64_t)(uint32_t)(blocked ? p.pad_class : c);
     }
-    for (uint32_t o = 0; o + 1u < ng; ++o) {
+    uint64_t rolling = toks[0] * p.multipliers[e * 8u + 0u];
+    for (uint32_t o = 1; o < ng && o < 8u; ++o) {
+      rolling ^= toks[o] * p.multipliers[e * 8u + o];
       for (uint32_t h = 0; h < p.heads_per_ngram; ++h) {
-        const uint32_t col = o * p.heads_per_ngram + h;
+        const uint32_t col = (o - 1u) * p.heads_per_ngram + h;
         if (col >= cols)
           continue;
         out[i * cols + col] =
-            (int32_t)(rh % (uint32_t)p.primes[e * cols + col]) +
+            (int32_t)(rolling % (uint64_t)p.primes[e * cols + col]) +
             p.offsets[e * cols + col];
       }
     }
@@ -5097,6 +5099,12 @@ static bool rocm_graph_prefill_layer_major(
       std::vector<int32_t> engram_toks(n_tokens);
       for (uint32_t i = 0; i < n_tokens; ++i)
         engram_toks[i] = (int32_t)prompt->v[start + i];
+      if (getenv("DS4_ENGRAM_DEBUG")) {
+        fprintf(stderr, "ds4: prompt ids n=%u start=%u:", n_tokens, start);
+        for (uint32_t i = 0; i < n_tokens && i < 32u; ++i)
+          fprintf(stderr, " %d", engram_toks[i]);
+        fprintf(stderr, "\n");
+      }
       ok = rocm_graph_engram_prepare(g, model->map, engram_toks.data(), n_tokens, start);
     }
     if (ok)
@@ -5889,6 +5897,12 @@ static bool rocm_graph_verify_suffix(ds4_gpu_graph* g, const ds4_model* model,
     std::vector<int32_t> engram_toks(n_tokens);
     for (uint32_t i = 0; i < n_tokens; ++i)
       engram_toks[i] = (int32_t)tokens->v[start + i];
+    if (getenv("DS4_ENGRAM_DEBUG")) {
+      fprintf(stderr, "ds4: prompt ids n=%u:", n_tokens);
+      for (uint32_t i = 0; i < n_tokens && i < 32u; ++i)
+        fprintf(stderr, " %d", engram_toks[i]);
+      fprintf(stderr, "\n");
+    }
     if (!rocm_graph_engram_prepare(g, model->map, engram_toks.data(), n_tokens, start))
       return false;
   }
