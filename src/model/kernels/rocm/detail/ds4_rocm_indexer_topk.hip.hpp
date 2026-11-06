@@ -605,3 +605,126 @@ static bool indexer_partial_topk_launch(uint32_t* selected, const float* scores,
         <<<n_tokens, 512>>>(selected, scores, n_comp, n_tokens);
   return true;
 }
+
+/* =======================================================================
+ * V4.1 two-level candidate selection (reference DeepSeek V4.1 attention):
+ * pool index scores into fixed blocks of `block_size` compressed positions,
+ * keep the `top_k_blocks` highest-scoring blocks (the block containing the
+ * last reachable position is always kept; unreachable/-inf blocks are not),
+ * and emit a per-position F32 mask.  Folding dropped positions into -inf
+ * lets the regular top-k operate over the candidate set unchanged.
+ * ======================================================================= */
+#define DS4_CAND_MAX_BLOCKS 8192u
+
+__device__ __forceinline__ static uint32_t cand_monotonic(float v) {
+  uint32_t u = __float_as_uint(v);
+  return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+__global__ static void indexer_candidate_mask_kernel(const float *scores,
+                                                     uint32_t n_reach,
+                                                     uint32_t block_size,
+                                                     uint32_t top_k_blocks,
+                                                     float *mask,
+                                                     uint32_t n_mask) {
+  __shared__ uint32_t bs[DS4_CAND_MAX_BLOCKS];
+  const uint32_t n_blocks = (n_reach + block_size - 1u) / block_size;
+  for (uint32_t i = threadIdx.x; i < DS4_CAND_MAX_BLOCKS; i += blockDim.x)
+    bs[i] = 0u;  /* == monotonic(-inf) */
+  __syncthreads();
+  for (uint32_t b = threadIdx.x; b < n_blocks; b += blockDim.x) {
+    const uint32_t lo = b * block_size;
+    const uint32_t hi = min(lo + block_size, n_reach);
+    float m = -INFINITY;
+    for (uint32_t c = lo; c < hi; c++) {
+      const float v = scores[c];
+      if (v > m) m = v;
+    }
+    bs[b] = cand_monotonic(m);
+  }
+  __syncthreads();
+  /* kth-largest monotonic key by counting bisection over the uint32 domain.
+   * hi_k must start at the largest EXISTING key: seeding it with 0xffffffff
+   * makes `lo + (hi - lo + 1)/2` wrap to lo on the first round, `mid == lo`
+   * then repeats forever and the workgroup deadlocks on the GPU. */
+  const uint32_t k = min(top_k_blocks, n_blocks);
+  __shared__ uint32_t red[256];
+  __shared__ uint32_t total;
+  uint32_t cnt = 0u;
+  for (uint32_t i = threadIdx.x; i < n_blocks; i += blockDim.x)
+    if (bs[i] > cnt) cnt = bs[i];
+  red[threadIdx.x] = cnt;
+  __syncthreads();
+  if (threadIdx.x == 0u) {
+    uint32_t mx = 0u;
+    for (uint32_t i = 0; i < blockDim.x; i++)
+      if (red[i] > mx) mx = red[i];
+    total = mx;
+  }
+  __syncthreads();
+  uint32_t lo_k = 0u, hi_k = total;
+  while (lo_k < hi_k) {
+    const uint32_t mid = lo_k + (hi_k - lo_k + 1u) / 2u;
+    cnt = 0u;
+    for (uint32_t i = threadIdx.x; i < n_blocks; i += blockDim.x)
+      if (bs[i] >= mid) cnt++;
+    red[threadIdx.x] = cnt;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+      uint32_t s = 0u;
+      for (uint32_t i = 0; i < blockDim.x; i++) s += red[i];
+      total = s;
+    }
+    __syncthreads();
+    cnt = total;
+    __syncthreads();
+    if (cnt >= k) lo_k = mid; else hi_k = mid - 1u;
+  }
+  const uint32_t pinned = (n_reach - 1u) / block_size;
+  for (uint32_t c = threadIdx.x; c < n_mask; c += blockDim.x)
+    mask[c] = (c < n_reach && (c / block_size == pinned || bs[c / block_size] >= lo_k))
+                  ? 1.0f : 0.0f;
+}
+
+extern "C" int ds4_gpu_indexer_candidate_mask_tensor(
+    const ds4_gpu_tensor *scores, uint32_t n_comp, uint32_t block_size,
+    uint32_t top_k_blocks, ds4_gpu_tensor *mask) {
+  if (!scores || !mask || block_size == 0u || top_k_blocks == 0u ||
+      n_comp == 0u || !hip_tensor_has_f32(scores, n_comp) ||
+      !hip_tensor_has_f32(mask, n_comp))
+    return 0;
+  const uint32_t n_blocks = (n_comp + block_size - 1u) / block_size;
+  if (n_blocks == 0u) return 0;
+  if (n_blocks > DS4_CAND_MAX_BLOCKS) {
+    /* Context too wide for the single-workgroup pool: fall back to
+     * "every reachable position is a candidate" (mask all ones), which the
+     * top-k handles as plain selection. */
+    const float one = 1.0f;
+    return ds4_gpu_tensor_fill_f32(mask, one, n_comp);
+  }
+  indexer_candidate_mask_kernel<<<1, 256>>>(
+      (const float *)scores->ptr, n_comp, block_size, top_k_blocks,
+      (float *)mask->ptr, n_comp);
+  return hip_ok(hipGetLastError(), "cand mask launch");
+}
+
+__global__ static void indexer_apply_mask_kernel(float *scores,
+                                                 const float *mask,
+                                                 uint32_t n_comp) {
+  for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < n_comp;
+       c += blockDim.x * gridDim.x)
+    if (mask[c] <= 0.0f) scores[c] = -INFINITY;
+}
+
+extern "C" int ds4_gpu_indexer_apply_mask_tensor(ds4_gpu_tensor *scores,
+                                                 uint32_t n_comp,
+                                                 const ds4_gpu_tensor *mask) {
+  if (!scores || !mask || n_comp == 0u ||
+      !hip_tensor_has_f32(scores, n_comp) ||
+      !hip_tensor_has_f32(mask, n_comp))
+    return 0;
+  const uint32_t blocks = (n_comp + 255u) / 256u;
+  indexer_apply_mask_kernel<<<blocks, 256>>>((float *)scores->ptr,
+                                             (const float *)mask->ptr, n_comp);
+  return hip_ok(hipGetLastError(), "cand apply");
+}

@@ -184,8 +184,9 @@ struct ds4_compressor_decode_job {
     const float *sc;
     float *state_kv;
     float *state_score;
-    float *comp_row;
-    __half *comp_mirror;
+    float *comp_row;         /* NULL when !emit */
+    __half *comp_mirror;     /* NULL when unused */
+    float *latent_out;       /* V4.1: pre-RoPE normalized row (NULL = off) */
     const void *ape;
     const float *norm_w;
     uint32_t ape_type;
@@ -222,6 +223,12 @@ __global__ static void compressor_decode_kernel(ds4_compressor_decode_job job0,
     __shared__ float scratch[256];
     rms_norm_weight_row(job.comp_row, job.comp_row, job.norm_w, head_dim, rms_eps, scratch);
     __syncthreads();
+    /* V4.1: the index key is built from the normalized latent BEFORE the
+     * RoPE/rounding below, so stage a copy while the row is exact. */
+    if (job.latent_out) {
+        for (uint32_t d = tid; d < head_dim; d += blockDim.x)
+            job.latent_out[d] = job.comp_row[d];
+    }
     if (tid < rope.n_rot / 2u) {
         rope_tail_rotate_pair(job.comp_row + head_dim - rope.n_rot, tid, pos + 1u - ratio, rope);
     }
@@ -375,6 +382,10 @@ extern "C" int ds4_gpu_compressor_decode_tensor(
         job.state_score = (float *)st.state_score->ptr;
         job.comp_row = st.comp_cache ? (float *)st.comp_cache->ptr + (uint64_t)st.comp_row * head_dim : NULL;
         job.comp_mirror = st.comp_mirror ? (__half *)st.comp_mirror->ptr + (uint64_t)st.comp_row * head_dim : NULL;
+        /* latent staging only exists on emit steps; the row is read next by
+         * the V4.1 index-key matmul. */
+        job.latent_out = (emit && st.latent_out) ? (float *)st.latent_out->ptr : NULL;
+        if (st.latent_out && !hip_tensor_has_f32(st.latent_out, head_dim)) return 0;
         job.ape_type = st.ape_type;
         job.head_dim = head_dim;
         job.qat = st.qat ? 1u : 0u;

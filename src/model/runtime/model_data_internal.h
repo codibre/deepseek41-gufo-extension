@@ -187,6 +187,10 @@ uint32_t ds4_layer_kv_source(uint32_t layer);
 uint32_t ds4_layer_topk_source(uint32_t layer);
 bool ds4_layer_is_kv_source(uint32_t layer);
 bool ds4_layer_is_topk_source(uint32_t layer);
+/* V4.1 two-level candidate selection metadata (GGUF-authoritative):
+ * candidate_source_layer, top_k_blocks and block_size (0 = disabled). */
+void ds4_cand_params(uint32_t *layer, uint32_t *top_k_blocks,
+                     uint32_t *block_size);
 int ds4_ple_module_for_layer(uint32_t layer);
 
 using token_vec = ds4_tokens;

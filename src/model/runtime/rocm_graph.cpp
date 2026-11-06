@@ -125,6 +125,18 @@ struct ds4_rocm_graph {
     ds4_gpu_tensor *indexer_weights;
     ds4_gpu_tensor* indexer_scores;
     ds4_gpu_tensor *comp_selected;
+    /* V4.1 source sharing.  comp_latent stages the pre-RoPE pooled latent of
+     * the emit step so the index key can be derived before rotation.
+     * shared_topk carries one published top-k row from the indexer layer to
+     * every grouped reader of the same decode step; cand_mask holds the
+     * layer-20 two-level candidate mask consumed by later indexer layers. */
+    ds4_gpu_tensor *comp_latent;
+    ds4_gpu_tensor *shared_topk;
+    ds4_gpu_tensor *cand_mask;
+    uint32_t shared_topk_n;
+    uint32_t shared_topk_kv;   /* compressed-cache owner the row indexes */
+    uint32_t cand_mask_n;
+    bool cand_mask_valid;
     ds4_gpu_tensor *heads;
     ds4_gpu_tensor *heads_q8;
     ds4_gpu_tensor *attn_low;
@@ -560,6 +572,9 @@ static void rocm_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->comp_sc_cur);
     ds4_gpu_tensor_free(g->comp_kv_cur);
     ds4_gpu_tensor_free(g->comp_selected);
+    ds4_gpu_tensor_free(g->comp_latent);
+    ds4_gpu_tensor_free(g->shared_topk);
+    ds4_gpu_tensor_free(g->cand_mask);
     ds4_gpu_tensor_free(g->indexer_scores);
     ds4_gpu_tensor_free(g->indexer_weights);
     ds4_gpu_tensor_free(g->indexer_q);
@@ -622,6 +637,9 @@ static uint64_t rocm_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32_
         if (ratio == 4) {
             bytes += comp_cap * DS4_N_HEAD_DIM * sizeof(uint16_t);
             bytes += comp_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+        } else if (ds4_layer_is_kv_source(il)) {
+            /* V4.1: only the owner of a shared group stores index keys. */
+            bytes += comp_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
         }
     }
     return bytes;
@@ -671,7 +689,13 @@ static bool rocm_graph_reserve_compressed_rows(ds4_gpu_graph *g, uint32_t il,
                    ds4_gpu_tensor_free);
   Tensor mirror(nullptr, ds4_gpu_tensor_free);
   Tensor indexer(nullptr, ds4_gpu_tensor_free);
-  const bool indexed = ds4_layer_compress_ratio(il) == 4;
+  const uint32_t grow_ratio = ds4_layer_compress_ratio(il);
+  const bool indexed = grow_ratio == 4;
+  /* V4.1 keeps one index cache per shared group; it grows with the owner's
+   * attention cache (readers never store rows). */
+  const bool v41_index = grow_ratio != 4 && ds4_layer_is_kv_source(il) &&
+                         ds4_layer_is_topk_source(il) &&
+                         g->layer_index_comp_cache[il] != NULL;
   if (indexed) {
     mirror.reset(rocm_graph_alloc_kv_cache_tensor(
         g->managed_kv_cache,
@@ -679,8 +703,13 @@ static bool rocm_graph_reserve_compressed_rows(ds4_gpu_graph *g, uint32_t il,
     indexer.reset(rocm_graph_alloc_kv_cache_tensor(
         g->managed_kv_cache,
         next_capacity * DS4_N_INDEXER_HEAD_DIM * sizeof(float)));
+  } else if (v41_index) {
+    indexer.reset(rocm_graph_alloc_kv_cache_tensor(
+        g->managed_kv_cache,
+        next_capacity * DS4_N_INDEXER_HEAD_DIM * sizeof(float)));
   }
-  if (!attention || (indexed && (!mirror || !indexer))) {
+  if (!attention || (indexed && (!mirror || !indexer)) ||
+      (v41_index && !indexer)) {
     fprintf(stderr,
             "ds4: reserve comp rows: alloc failed layer=%u next=%llu "
             "attention=%p mirror=%p indexer=%p\n",
@@ -699,7 +728,11 @@ static bool rocm_graph_reserve_compressed_rows(ds4_gpu_graph *g, uint32_t il,
                                   DS4_N_HEAD_DIM * sizeof(uint16_t)) ||
                    !copy_rows(indexer.get(), g->layer_index_comp_cache[il],
                               static_cast<uint64_t>(g->layer_n_index_comp[il]) *
-                                  DS4_N_INDEXER_HEAD_DIM * sizeof(float))))) {
+                                  DS4_N_INDEXER_HEAD_DIM * sizeof(float)))) ||
+      (v41_index && g->layer_index_comp_cache[il] &&
+       !copy_rows(indexer.get(), g->layer_index_comp_cache[il],
+                  static_cast<uint64_t>(g->layer_n_index_comp[il]) *
+                      DS4_N_INDEXER_HEAD_DIM * sizeof(float)))) {
     fprintf(stderr, "ds4: reserve comp rows: copy failed layer=%u req=%u\n",
             il, required);
     return false;
@@ -861,7 +894,11 @@ static bool rocm_graph_alloc_raw_cap(
                                 rocm_tensor_fill_f32(g->layer_attn_state_score[il], DS4_NEG_INF, attn_width * attn_rows);
             }
 
-            if (ratio == 4) {
+            if (ratio == 4 ||
+                (ds4_layer_is_kv_source(il) &&
+                 ds4_layer_is_topk_source(il))) {
+                /* V3 indexed layers store their own index keys; V4.1 stores
+                 * one index cache per shared group (on the owner layer). */
                 const uint64_t index_width = (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM;
                 const uint64_t index_rows = (uint64_t)coff * ratio;
                 g->layer_index_comp_cache[il] =
@@ -897,6 +934,11 @@ static bool rocm_graph_alloc_raw_cap(
         ds4_gpu_tensor_alloc(initial_score_count * sizeof(float));
     g->comp_selected = ds4_gpu_tensor_alloc((uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u) *
                                               pc * sizeof(uint32_t));
+    /* V4.1 source-sharing staging (tiny; single-row decode semantics). */
+    g->comp_latent = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+    g->shared_topk = ds4_gpu_tensor_alloc((uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u) *
+                                              sizeof(uint32_t));
+    g->cand_mask = ds4_gpu_tensor_alloc((uint64_t)(g->comp_cap ? g->comp_cap : 2u) * sizeof(float));
     g->heads = ds4_gpu_tensor_alloc(q_dim * sizeof(float));
     g->heads_q8 = ds4_gpu_tensor_alloc(ds4_gpu_q8_0_act_bytes(q_dim));
     g->attn_low = ds4_gpu_tensor_alloc(low_dim * sizeof(float));
@@ -1727,6 +1769,12 @@ static bool rocm_graph_encode_decode_layer(
             ok = rocm_tensor_fill_f32(g->comp_sc_cur, 0.0f, comp_width);
         }
         const bool indexed = ratio == 4;
+        /* V4.1 source-sharing artifact signature: two-level candidate
+         * metadata exists only in V4.1 GGUFs.  Indexed layers there are the
+         * top-k publishers, not ratio-4 layers. */
+        uint32_t cand_layer = 0, cand_blocks = 0, cand_block_size = 0;
+        ds4_cand_params(&cand_layer, &cand_blocks, &cand_block_size);
+        const bool v41 = cand_block_size != 0u && cand_blocks != 0u;
         const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
         if (ok && indexed) {
             if (!layer->indexer_compressor_kv ||
@@ -1776,7 +1824,9 @@ static bool rocm_graph_encode_decode_layer(
                  g->layer_attn_comp_cache_f16[il],
                  rocm_graph_attn_comp_update_row(g->layer_n_comp[il]),
                  rocm_graph_opt_w_off(layer->attn_compressor_ape), rocm_graph_opt_w_type(layer->attn_compressor_ape),
-                 layer->attn_compressor_norm->abs_offset, DS4_N_HEAD_DIM, false},
+                 layer->attn_compressor_norm->abs_offset, DS4_N_HEAD_DIM, false,
+                 /*V4.1 index-k staging: pre-RoPE pooled latent (NULL-able). */
+                 (v41 && ds4_layer_is_kv_source(il)) ? g->comp_latent : NULL},
                 {g->index_kv_cur, g->index_sc_cur, g->layer_index_state_kv[il],
                  g->layer_index_state_score[il], g->layer_index_comp_cache[il], NULL,
                  g->layer_n_index_comp[il],
@@ -1794,6 +1844,57 @@ static bool rocm_graph_encode_decode_layer(
         if (ok && emit && ds4_comp_producer) {
             g->layer_n_comp[il]++;
             if (indexed) g->layer_n_index_comp[il]++;
+        }
+
+        /* V4.1 index key: derived from the pooled latent BEFORE RoPE
+         * (reference Indexer: attn_k -> k_norm -> rope tail -> QAT), stored
+         * as one row of the owner layer's shared index cache. */
+        if (ok && v41 && emit && ds4_layer_is_kv_source(il) &&
+            ds4_layer_is_topk_source(il)) {
+            if (!layer->indexer_attn_k || !layer->indexer_k_norm ||
+                layer->indexer_attn_k->dim[0] != DS4_N_HEAD_DIM ||
+                layer->indexer_attn_k->dim[1] != DS4_N_INDEXER_HEAD_DIM) {
+                fprintf(stderr,
+                        "ds4: ROCm graph V4.1 index-k weights missing at layer %u\n",
+                        il);
+                ok = false;
+            }
+            if (ok && g->layer_n_index_comp[il] >= g->layer_comp_cap[il]) {
+                fprintf(stderr,
+                        "ds4: ROCm graph V4.1 index cache capacity exceeded at layer %u\n",
+                        il);
+                ok = false;
+            }
+            ds4_gpu_tensor *krow = NULL;
+            if (ok)
+                krow = ds4_gpu_tensor_view(
+                    g->layer_index_comp_cache[il],
+                    (uint64_t)g->layer_n_index_comp[il] *
+                        DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                    (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+            if (ok && !krow) ok = false;
+            if (ok)
+                ok = rocm_graph_matmul_weight_tensor(
+                         krow, model, layer->indexer_attn_k, DS4_N_HEAD_DIM,
+                         DS4_N_INDEXER_HEAD_DIM, g->comp_latent, 1);
+            if (ok)
+                ok = ds4_gpu_rms_norm_weight_rows_tensor(
+                         krow, krow, model->map, model->size,
+                         layer->indexer_k_norm->abs_offset,
+                         DS4_N_INDEXER_HEAD_DIM, 1, DS4_RMS_EPS) != 0;
+            if (ok)
+                ok = ds4_gpu_rope_tail_tensor(
+                         krow, 1, 1, DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT,
+                         pos + 1u - ratio,
+                         compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0, false,
+                         freq_base, freq_scale, ext_factor, attn_factor,
+                         DS4_ROPE_YARN_BETA_FAST,
+                         DS4_ROPE_YARN_BETA_SLOW) != 0;
+            if (ok)
+                ok = ds4_gpu_dsv4_indexer_qat_tensor(
+                         krow, 1, DS4_N_INDEXER_HEAD_DIM) != 0;
+            ds4_gpu_tensor_free(krow);
+            if (ok) g->layer_n_index_comp[il]++;
         }
 
         if (ok && indexed) {
@@ -1907,6 +2008,106 @@ static bool rocm_graph_encode_decode_layer(
             }
         }
 
+        /* V4.1 indexer publisher: one top-k per step, computed by the group's
+         * index source over the OWNER's shared index cache, then published
+         * for every grouped reader (reference kv_source/topk_source lists). */
+        if (ok && v41 && ratio != 0 && ds4_layer_is_topk_source(il)) {
+            const uint32_t idx_kv = ds4_layer_kv_source(il);
+            const uint32_t n_idx = g->layer_n_index_comp[idx_kv];
+            const uint64_t indexer_q_dim =
+                (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+            if (!layer->indexer_attn_q_b || !layer->indexer_proj ||
+                layer->indexer_attn_q_b->dim[0] != q_rank ||
+                layer->indexer_attn_q_b->dim[1] != indexer_q_dim ||
+                layer->indexer_proj->dim[0] != DS4_N_EMBD ||
+                layer->indexer_proj->dim[1] != DS4_N_INDEXER_HEAD) {
+                fprintf(stderr,
+                        "ds4: ROCm graph V4.1 indexer projections missing/mismatched at layer %u\n",
+                        il);
+                ok = false;
+            }
+            if (ok && n_idx > 0u && g->layer_index_comp_cache[idx_kv] == NULL) {
+                fprintf(stderr,
+                        "ds4: ROCm graph V4.1 shared index cache absent for layer %u (owner %u)\n",
+                        il, idx_kv);
+                ok = false;
+            }
+            if (ok && n_idx > 0u) {
+                ok = rocm_graph_matmul_hc_fn_tensor(
+                         g->indexer_q, model, layer->indexer_attn_q_b,
+                         q_rank, indexer_q_dim, g->qr_norm, 1);
+                if (ok)
+                    ok = ds4_gpu_dsv4_indexer_rope_qat_tensor(
+                             g->indexer_q, DS4_N_INDEXER_HEAD,
+                             DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT, pos,
+                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                             freq_base, freq_scale, ext_factor, attn_factor,
+                             DS4_ROPE_YARN_BETA_FAST,
+                             DS4_ROPE_YARN_BETA_SLOW) != 0;
+                if (ok)
+                    ok = rocm_graph_matmul_hc_fn_tensor(
+                             g->indexer_weights, model, layer->indexer_proj,
+                             DS4_N_EMBD, DS4_N_INDEXER_HEAD, g->attn_norm, 1);
+                const float index_scale =
+                    1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM *
+                                         DS4_N_INDEXER_HEAD));
+                if (ok)
+                    ok = rocm_graph_reserve_indexer_scores(g, n_idx, 1) &&
+                         ds4_gpu_indexer_score_one_tensor(
+                             g->indexer_scores, g->indexer_q,
+                             g->indexer_weights,
+                             g->layer_index_comp_cache[idx_kv], n_idx,
+                             DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
+                             index_scale) != 0;
+                /* Two-level selection: publish candidates at the candidate
+                 * source; every later publisher restricts its top-k to that
+                 * candidate set (reference candidate_source_layer). */
+                if (ok && il == cand_layer) {
+                    ok = ds4_gpu_indexer_candidate_mask_tensor(
+                             g->indexer_scores, n_idx, cand_block_size,
+                             cand_blocks, g->cand_mask) != 0;
+                    if (ok) {
+                        g->cand_mask_n = n_idx;
+                        g->cand_mask_valid = true;
+                    }
+                }
+                if (ok && g->cand_mask_valid && g->cand_mask_n >= n_idx)
+                    ok = ds4_gpu_indexer_apply_mask_tensor(
+                             g->indexer_scores, n_idx, g->cand_mask) != 0;
+                if (ok) {
+                    /* Reference selects min(top_k, available) rows; the top-k
+                     * kernel rejects top_k > n_comp outright. */
+                    const uint32_t top_k_sel =
+                        n_idx < DS4_N_INDEXER_TOP_K ? n_idx : DS4_N_INDEXER_TOP_K;
+                    ok = ds4_gpu_indexer_topk_tensor(
+                             g->comp_selected, g->indexer_scores, n_idx, 1,
+                             top_k_sel) != 0;
+                    if (ok) {
+                        g->shared_topk_n = top_k_sel;
+                        g->shared_topk_kv = idx_kv;
+                        ok = ds4_gpu_tensor_copy(
+                                 g->shared_topk, 0, g->comp_selected, 0,
+                                 (uint64_t)g->shared_topk_n *
+                                     sizeof(uint32_t)) != 0;
+                    }
+                }
+                if (ok) {
+                    comp_selected = g->shared_topk;
+                    n_selected = g->shared_topk_n;
+                }
+            }
+        }
+
+        /* Grouped readers consume the top-k published earlier this step by
+         * their index source; nothing published yet (or an owner switch)
+         * leaves them on the dense fallback. */
+        if (ok && v41 && ratio != 0 && !ds4_layer_is_topk_source(il) &&
+            g->shared_topk_n > 0u &&
+            g->shared_topk_kv == ds4_layer_kv_source(il)) {
+            comp_selected = g->shared_topk;
+            n_selected = g->shared_topk_n;
+        }
+
         n_comp = g->layer_n_comp[rocm_graph_comp_src(il)];
         comp_cache = g->layer_attn_comp_cache[rocm_graph_comp_src(il)];
     }
@@ -1922,7 +2123,7 @@ static bool rocm_graph_encode_decode_layer(
                     layer->attn_sinks->abs_offset,
                     g->q,
                     raw_cache,
-                    g->layer_attn_comp_cache[il],
+                    comp_cache,
                     rocm_graph_attn_comp_cache_is_f16(),
                     comp_selected,
                     1,
@@ -2309,6 +2510,12 @@ static bool rocm_graph_encode_token_raw_swa(
                                               DS4_N_EMBD,
                                               DS4_N_HC,
                                               weights->token_embd->type) != 0;
+
+    /* One published top-k and one candidate mask live per decode step. */
+    g->shared_topk_n = 0;
+    g->shared_topk_kv = UINT32_MAX;
+    g->cand_mask_valid = false;
+    g->cand_mask_n = 0;
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         ok = rocm_graph_encode_decode_layer(g,

@@ -70,6 +70,10 @@ struct ds4_gpu_compressor_step {
     uint64_t norm_offset;          /* F32 norm weights */
     uint32_t head_dim;
     bool qat;                      /* indexer rows: Hadamard FP4, not FP8 */
+    /* V4.1: optional 1-row staging for the normalized, PRE-RoPE latent.
+     * The index key is derived from it before RoPE (reference V4.1 Indexer),
+     * while the attention cache row keeps the rotated, rounded form. */
+    ds4_gpu_tensor *latent_out;
 };
 /* One launch for up to two compressors of a layer: the state store, and on the
  * window's last token the pooled, normalized, rotated and rounded row plus the
@@ -139,6 +143,14 @@ int ds4_gpu_indexer_score_one_tensor(ds4_gpu_tensor *scores, const ds4_gpu_tenso
 int ds4_gpu_indexer_scores_decode_batch_tensor(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights, const ds4_gpu_tensor *index_comp, uint32_t n_comp, uint32_t n_tokens, uint32_t pos0, uint32_t n_head, uint32_t head_dim, uint32_t ratio, float scale, ds4_gpu_tensor *score_scratch);
 int ds4_gpu_indexer_scores_prefill_tensor(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights, const ds4_gpu_tensor *index_comp, uint32_t n_comp, uint32_t n_tokens, uint32_t n_head, uint32_t head_dim, uint32_t ratio, float scale, ds4_gpu_tensor *score_scratch);
 int ds4_gpu_indexer_topk_tensor(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k);
+/* V4.1 two-level selection (reference DeepSeek V4.1): block-pool scores over
+ * `block_size` consecutive compressed positions (invalid/-inf positions
+ * propagate, the block holding the last reachable position is always kept),
+ * keep the best `top_k_blocks` blocks, and emit one F32 mask row (`1` kept,
+ * `0` dropped) of length n_comp.  Apply folds dropped positions to -inf so
+ * the regular top-k never selects them. */
+int ds4_gpu_indexer_candidate_mask_tensor(const ds4_gpu_tensor *scores, uint32_t n_comp, uint32_t block_size, uint32_t top_k_blocks, ds4_gpu_tensor *mask);
+int ds4_gpu_indexer_apply_mask_tensor(ds4_gpu_tensor *scores, uint32_t n_comp, const ds4_gpu_tensor *mask);
 int ds4_gpu_init(void);
 int ds4_gpu_kv_fp8_store_raw_tensor(ds4_gpu_tensor *kv, ds4_gpu_tensor *raw_cache, uint32_t raw_cap, uint32_t row, uint32_t head_dim, uint32_t n_rot);
 int ds4_gpu_matmul_f16_pair_tensor(ds4_gpu_tensor *out_a, ds4_gpu_tensor *out_b, const void *model_map, uint64_t model_size, uint64_t weight_a_offset, uint64_t weight_b_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok);

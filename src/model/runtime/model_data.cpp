@@ -155,6 +155,13 @@ bool ds4_layer_is_topk_source(uint32_t il) {
     return il < DS4_N_LAYER && g_ds4_topk_source[il] == il;
 }
 
+void ds4_cand_params(uint32_t *layer, uint32_t *top_k_blocks,
+                     uint32_t *block_size) {
+    if (layer) *layer = g_ds4_cand_source_layer;
+    if (top_k_blocks) *top_k_blocks = g_ds4_cand_top_k_blocks;
+    if (block_size) *block_size = g_ds4_cand_block_size;
+}
+
 int ds4_ple_module_for_layer(uint32_t il) {
     return il < DS4_N_LAYER ? g_ds4_ple_module[il] : -1;
 }
