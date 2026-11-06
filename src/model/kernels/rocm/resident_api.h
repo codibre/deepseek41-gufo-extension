@@ -277,6 +277,20 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_snapshot_read(const ds4_gpu_tensor* tensor, uint64_t offset,
                                  void* data, uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
+
+/* Engram (D3): gather IQ1_S rows, Q5_K projection, sign-sqrt gate fold. */
+/* GPU-addressable view of the mmap'd model at [offset, offset+bytes). */
+const void *ds4_gpu_model_range_ptr(const void *model_map, uint64_t offset,
+                                    uint64_t bytes, const char *what);
+int ds4_gpu_engram_gather(const void *table_ptr, const ds4_gpu_tensor *ids,
+                          ds4_gpu_tensor *rows, uint32_t n_rows);
+int ds4_gpu_engram_kv(const ds4_gpu_tensor *rows, const void *kv_weight_ptr,
+                      ds4_gpu_tensor *kv, uint32_t nt, uint32_t out_dim,
+                      uint32_t in_dim, uint32_t k_blocks);
+int ds4_gpu_engram_gate(ds4_gpu_tensor *hc, const ds4_gpu_tensor *kv,
+                        const void *egate_ptr, uint32_t nt, uint32_t n_embd,
+                        uint32_t hc_mult, uint64_t hc_stride,
+                        uint64_t kv_stride, float eps);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 
 #ifdef __cplusplus

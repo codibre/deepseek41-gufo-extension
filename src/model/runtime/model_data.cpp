@@ -44,6 +44,8 @@ static uint32_t g_ds4_cand_top_k_blocks = 0;
 static uint32_t g_ds4_cand_block_size = 0;
 static int g_ds4_ple_module[DS4_N_LAYER];
 ds4_ple_state g_ds4_ple = {};
+uint64_t g_ds4_engram_table_off = 0;
+uint64_t g_ds4_engram_table_bytes = 0;
 
 static gufo::platform::FileLock g_ds4_lock;
 
@@ -305,8 +307,8 @@ static constexpr auto gguf_types = [] {
     types[16] = {"iq2_xxs", 256, 66};
     types[17] = {"iq2_xs", 256, 74};
     types[18] = {"iq3_xxs", 256, 98};
-    types[19] = {"iq1_s", 256, 110};
-    types[20] = {"iq4_nl", 256, 50};
+    types[19] = {"iq1_s", 256, 50};
+    types[20] = {"iq4_nl", 32, 18};
     types[21] = {"iq3_s", 256, 110};
     types[22] = {"iq2_s", 256, 82};
     types[23] = {"iq4_xs", 256, 136};
@@ -1815,6 +1817,10 @@ static void weights_bind(ds4_weights *w, const ds4_model *m) {
     w->output_norm      = required_tensor(m, "output_norm.weight");
     w->output           = required_tensor(m, "output.weight");
     w->per_layer_token_embd = required_tensor(m, "per_layer_token_embd.weight");
+    g_ds4_engram_table_off =
+        w->per_layer_token_embd ? w->per_layer_token_embd->abs_offset : 0;
+    g_ds4_engram_table_bytes =
+        w->per_layer_token_embd ? w->per_layer_token_embd->bytes : 0;
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_layer_weights *l = &w->layer[il];

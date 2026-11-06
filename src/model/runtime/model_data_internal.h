@@ -179,6 +179,10 @@ struct ds4_ple_state {
 
 extern ds4_ple_state g_ds4_ple;
 
+/* abs_offset of per_layer_token_embd.weight (Engram IQ1_S row table). */
+extern uint64_t g_ds4_engram_table_off;
+extern uint64_t g_ds4_engram_table_bytes;
+
 uint32_t ds4_layer_kv_source(uint32_t layer);
 uint32_t ds4_layer_topk_source(uint32_t layer);
 bool ds4_layer_is_kv_source(uint32_t layer);

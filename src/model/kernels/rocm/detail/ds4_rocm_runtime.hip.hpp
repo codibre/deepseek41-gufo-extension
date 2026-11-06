@@ -363,6 +363,12 @@ static int hip_model_range_is_cached(const void *model_map, uint64_t offset, uin
     return 0;
 }
 
+extern "C" const void *ds4_gpu_model_range_ptr(const void *model_map,
+                                               uint64_t offset, uint64_t bytes,
+                                               const char *what) {
+    return hip_model_range_ptr(model_map, offset, bytes, what);
+}
+
 static void hip_q8_f16_cache_release_all(void) {
     for (const hip_q8_f16_transpose_range &r : g_q8_f16_transpose_ranges) {
         (void)hipFree(r.device_ptr);

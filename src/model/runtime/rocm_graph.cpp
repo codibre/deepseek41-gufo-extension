@@ -165,7 +165,12 @@ struct ds4_rocm_graph {
      * avoids a slow loop of one-token graph steps for long prompts. */
     ds4_gpu_tensor *prefill_tokens;
     ds4_gpu_tensor* batch_stage_scratch;
-    ds4_gpu_tensor *batch_cur_hc;
+    ds4_gpu_tensor *batch_cur_hc = nullptr;
+    // Engram (D3): per-module staged head ids + gathered rows/kv scratch.
+    ds4_gpu_tensor *engram_ids[DS4_PLE_MAX_LAYERS] = {};
+    ds4_gpu_tensor *engram_rows[DS4_PLE_MAX_LAYERS] = {};
+    ds4_gpu_tensor *engram_kv[DS4_PLE_MAX_LAYERS] = {};
+    std::vector<int32_t> token_hist;
     ds4_gpu_tensor *batch_next_hc;
     ds4_gpu_tensor* batch_flat_hc;
     ds4_gpu_tensor *batch_hc_mix;
@@ -503,6 +508,14 @@ static void rocm_graph_free_batch_workspace(ds4_gpu_graph *g) {
   ds4_gpu_tensor_free(g->batch_next_hc);
   ds4_gpu_tensor_free(g->batch_cur_hc);
   ds4_gpu_tensor_free(g->prefill_tokens);
+    for (uint32_t e = 0; e < DS4_PLE_MAX_LAYERS; ++e) {
+      ds4_gpu_tensor_free(g->engram_ids[e]);
+      g->engram_ids[e] = nullptr;
+      ds4_gpu_tensor_free(g->engram_rows[e]);
+      g->engram_rows[e] = nullptr;
+      ds4_gpu_tensor_free(g->engram_kv[e]);
+      g->engram_kv[e] = nullptr;
+    }
   ds4_gpu_tensor_free(g->batch_stage_scratch);
 }
 
@@ -939,6 +952,19 @@ static bool rocm_graph_alloc_raw_cap(
           std::max({2 * q_bytes, hc_bytes, down_offset + routed_down_bytes}));
       g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
       g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
+      if (g_ds4_ple.present) {
+        const uint32_t eg_cols = g_ds4_ple.cols_per_module;
+        const uint64_t eg_in = (uint64_t)eg_cols * DS4_PLE_EMBD;
+        for (uint32_t e = 0; e < g_ds4_ple.n_modules && e < DS4_PLE_MAX_LAYERS;
+             ++e) {
+          g->engram_ids[e] = ds4_gpu_tensor_alloc(pc * eg_cols * sizeof(int32_t));
+          g->engram_rows[e] = ds4_gpu_tensor_alloc(pc * eg_in * sizeof(float));
+          g->engram_kv[e] = ds4_gpu_tensor_alloc(
+              pc * (DS4_N_HC + 1u) * DS4_N_EMBD * sizeof(float));
+          if (!g->engram_ids[e] || !g->engram_rows[e] || !g->engram_kv[e])
+            fprintf(stderr, "ds4: engram scratch alloc failed module %u\n", e);
+        }
+      }
       g->batch_next_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
       g->batch_flat_hc =
           ds4_gpu_tensor_view(g->batch_stage_scratch, 0, hc_bytes);
@@ -1318,6 +1344,216 @@ static bool rocm_graph_matmul_v41_dense_tensor(
         uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x,
         uint64_t n_tok);
 
+// ---------------------------------------------------------------------------
+// Engram (D3): n-gram conditioned memory applied at the Engram PLE layers
+// (artifact: blk.1 / blk.14).  Host side keeps the token history, computes the
+// two module head-id rows exactly as llama.cpp b11870 deepseek41.cpp does, and
+// stages them into per-graph input buffers; the captured kernels gather the
+// IQ1_S table rows (host-resident, read AS IS — never uploaded), project them
+// through the Q5_K engram_kv matrix and fold value*gate back into the HC
+// stream with the sign-sqrt gate.
+// ---------------------------------------------------------------------------
+static int32_t rocm_engram_class_of(const ds4_ple_state &p, int t) {
+  if (t < 0 || (size_t)t >= p.token_map.size())
+    return (int32_t)DS4_PLE_DEAD;
+  return p.token_map[(size_t)t];
+}
+
+static void rocm_engram_hash_rows(const std::vector<int32_t> &hist,
+                                  uint32_t start, uint32_t n, uint32_t e,
+                                  std::vector<int32_t> &out) {
+  const ds4_ple_state &p = g_ds4_ple;
+  const uint32_t cols = p.cols_per_module;
+  const uint32_t ng = p.ngram;
+  out.resize((size_t)n * cols);
+  for (size_t i = 0; i < n; ++i) {
+    const uint32_t pos = start + (uint32_t)i;
+    int32_t toks[8];
+    bool blocked = false;
+    toks[0] = rocm_engram_class_of(p, hist[pos]);
+    blocked = toks[0] == (int32_t)DS4_PLE_DEAD;
+    if (blocked)
+      toks[0] = p.pad_class;
+    uint32_t rh = (uint32_t)toks[0] * (uint32_t)p.multipliers[e * 8u + 0u];
+    for (uint32_t s = 1; s < ng && s < 8u; ++s) {
+      int32_t c = pos < s ? (int32_t)DS4_PLE_DEAD
+                          : rocm_engram_class_of(p, hist[pos - s]);
+      blocked = blocked || c == (int32_t)DS4_PLE_DEAD;
+      toks[s] = blocked ? p.pad_class : c;
+      rh ^= (uint32_t)toks[s] * (uint32_t)p.multipliers[e * 8u + s];
+    }
+    for (uint32_t o = 0; o + 1u < ng; ++o) {
+      for (uint32_t h = 0; h < p.heads_per_ngram; ++h) {
+        const uint32_t col = o * p.heads_per_ngram + h;
+        if (col >= cols)
+          continue;
+        out[i * cols + col] =
+            (int32_t)(rh % (uint32_t)p.primes[e * cols + col]) +
+            p.offsets[e * cols + col];
+      }
+    }
+  }
+}
+
+// IQ4_NL code values of this GGML fork (ggml-common.h kvalues_iq4nl).
+static const int8_t g_ds4_iq4nl_vals[16] = {-127, -104, -83, -65, -49, -35,
+                                            -22,  -10,  1,   13,
+                                            25,   38,   53,  69,
+                                            89,   113};
+
+static inline float ds4_h2f(uint16_t v) {
+  const uint32_t sign = (uint32_t)(v >> 15) & 1u;
+  const uint32_t exp = (uint32_t)(v >> 10) & 0x1fu;
+  const uint32_t man = (uint32_t)v & 0x3ffu;
+  uint32_t f;
+  if (exp == 0u)
+    return (sign ? -1.0f : 1.0f) * (float)man * 5.96046448e-8f;
+  if (exp == 31u)
+    return man ? NAN : (sign ? -INFINITY : INFINITY);
+  f = (sign << 31) | ((exp + 112u) << 23) | (man << 13);
+  float out;
+  __builtin_memcpy(&out, &f, 4);
+  return out;
+}
+
+// The Engram table is a ~110 GB IQ4_NL file region — far too big for any
+// device mapping (the driver refuses: "SVM mapping failed, exceeds resident
+// system memory limit"). Rows are random-access anyway, so gather them on
+// the host straight from the mmap (AS IS, no copies kept) and upload only
+// the few MB the current step needs.
+static bool rocm_engram_gather_rows_host(const void *map,
+                                         const std::vector<int32_t> &ids,
+                                         std::vector<float> &out) {
+  const uint8_t *tbl = (const uint8_t *)map + g_ds4_engram_table_off;
+  out.assign((size_t)ids.size() * 256u, 0.0f);
+  for (size_t r = 0; r < ids.size(); ++r) {
+    const uint8_t *p = tbl + (size_t)ids[r] * 144u;
+    float *d = out.data() + r * 256u;
+    for (int b = 0; b < 8; ++b) {
+      uint16_t hb;
+      __builtin_memcpy(&hb, p + b * 18, 2);
+      const float sc = ds4_h2f(hb);
+      for (int q = 0; q < 16; ++q) {
+        const uint8_t by = p[b * 18 + 2 + q];
+        d[b * 32 + q] = sc * (float)g_ds4_iq4nl_vals[by & 15u];
+        d[b * 32 + 16 + q] = sc * (float)g_ds4_iq4nl_vals[by >> 4];
+      }
+    }
+  }
+  return true;
+}
+
+// Update the token history for tokens[pos..pos+n), stage head ids and the
+// host-gathered n-gram rows for every module.
+static bool rocm_graph_engram_prepare(ds4_gpu_graph *g, const void *map,
+                                      const int32_t *toks, uint32_t n,
+                                      uint32_t pos) {
+  if (!g_ds4_ple.present || !g->engram_ids[0])
+    return true;
+  if (g->token_hist.size() > pos)
+    g->token_hist.resize(pos);
+  while (g->token_hist.size() < pos)
+    g->token_hist.push_back(0);
+  g->token_hist.insert(g->token_hist.end(), toks, toks + n);
+  for (uint32_t e = 0; e < g_ds4_ple.n_modules && e < DS4_PLE_MAX_LAYERS; ++e) {
+    if (!g->engram_ids[e])
+      continue;
+    std::vector<int32_t> ids;
+    rocm_engram_hash_rows(g->token_hist, pos, n, e, ids);
+    const int64_t table_rows = (int64_t)(g_ds4_engram_table_bytes / 144u);
+    for (int32_t id : ids) {
+      if (id < 0 || (int64_t)id >= table_rows) {
+        fprintf(stderr, "ds4: engram id %d out of table rows %lld module %u\n",
+                id, (long long)table_rows, e);
+        return false;
+      }
+    }
+    if (getenv("DS4_ENGRAM_DEBUG")) {
+      fprintf(stderr, "ds4: engram ids mod=%u n=%u first=", e, n);
+      for (uint32_t i = 0; i < ids.size() && i < 24u; ++i)
+        fprintf(stderr, "%d ", ids[i]);
+      int32_t mn = ids[0], mx = ids[0];
+      for (int32_t id : ids) { if (id < mn) mn = id; if (id > mx) mx = id; }
+      fprintf(stderr, "| min=%d max=%d\n", mn, mx);
+    }
+    std::vector<float> rows;
+    if (!rocm_engram_gather_rows_host(map, ids, rows))
+      return false;
+    if (!ds4_gpu_tensor_write(g->engram_rows[e], 0, rows.data(),
+                              rows.size() * sizeof(float))) {
+      fprintf(stderr, "ds4: engram rows upload failed module=%u n=%u\n", e, n);
+      return false;
+    }
+  }
+  return true;
+}
+
+// Gather + project + gate for the Engram module owned by layer `il`.
+static bool rocm_graph_engram_at_layer(ds4_gpu_graph *g, const ds4_model *model,
+                                       const ds4_layer_weights *layer,
+                                       uint32_t il, ds4_gpu_tensor *hc,
+                                       uint32_t nt) {
+  if (!g_ds4_ple.present)
+    return true;
+  const int e = ds4_ple_module_for_layer(il);
+  if (e < 0 || !g->engram_rows[e] || !g->engram_kv[e] || nt == 0 ||
+      nt > g->prefill_cap)
+    return e < 0;
+  const ds4_tensor *ekv = layer->engram_kv;
+  const ds4_tensor *eg = layer->engram_gate;
+  if (!ekv || !eg)
+    return false;
+  const uint32_t cols = g_ds4_ple.cols_per_module;
+  const uint32_t in_dim = cols * DS4_PLE_EMBD;
+  const uint32_t out_dim = (DS4_N_HC + 1u) * DS4_N_EMBD;
+  const int no_kv = getenv("DS4_ENGRAM_NO_KV") != NULL;
+  const int no_gate = getenv("DS4_ENGRAM_NO_GATE") != NULL;
+  static int logged[DS4_PLE_MAX_LAYERS] = {0};
+  const uint64_t kv_row_stride =
+      ekv->dim[0] ? ekv->bytes / ekv->dim[0] : (uint64_t)in_dim * sizeof(int8_t);
+  if (!logged[e]) {
+    logged[e] = 1;
+    fprintf(stderr,
+            "ds4: engram mod=%u layer=%u table_off=%llu tbl[type=%u bytes=%llu] "
+            "kv[type=%u dim=%llu,%llu bytes=%llu row_stride=%llu] "
+            "gate[bytes=%llu] in=%u out=%u cap_ids=%llu\n",
+            e, il, (unsigned long long)g_ds4_engram_table_off, ekv->type,
+            (unsigned long long)g_ds4_engram_table_bytes, (unsigned long long)ekv->type,
+            (unsigned long long)ekv->dim[0], (unsigned long long)ekv->dim[1],
+            (unsigned long long)ekv->bytes, (unsigned long long)kv_row_stride,
+            (unsigned long long)eg->bytes, in_dim, out_dim,
+            (unsigned long long)ds4_gpu_tensor_bytes(g->engram_ids[e]));
+  }
+  ds4_gpu_tensor *v_rows = ds4_gpu_tensor_view(
+      g->engram_rows[e], 0, (uint64_t)nt * in_dim * sizeof(float));
+  ds4_gpu_tensor *v_kv = ds4_gpu_tensor_view(
+      g->engram_kv[e], 0, (uint64_t)nt * out_dim * sizeof(float));
+  bool ok = true;
+  if (!v_rows || !v_kv)
+    return false;
+  const char *kv_p = (const char *)ds4_gpu_model_range_ptr(
+      model->map, ekv->abs_offset, ekv->bytes, "engram kv");
+  const char *gate_p = (const char *)ds4_gpu_model_range_ptr(
+      model->map, eg->abs_offset, eg->bytes, "engram gate");
+  if (!kv_p || !gate_p) {
+    fprintf(stderr, "ds4: engram range resolve failed mod=%u\n", e);
+    return false;
+  }
+  // Rows were host-gathered by rocm_graph_engram_prepare for this step.
+  if (!no_kv)
+    ok = ds4_gpu_engram_kv(v_rows, kv_p, v_kv, nt, out_dim,
+                           in_dim, in_dim / 256u) != 0 &&
+         ds4_gpu_probe_sync("engram kv") != 0;
+  if (ok && !no_gate)
+    ok = ds4_gpu_engram_gate(hc, v_kv, gate_p, nt, DS4_N_EMBD,
+                             DS4_N_HC, (uint64_t)DS4_N_HC * DS4_N_EMBD,
+                             out_dim, DS4_RMS_EPS) != 0 &&
+         ds4_gpu_probe_sync("engram gate") != 0;
+  ds4_gpu_tensor_free(v_rows);
+  ds4_gpu_tensor_free(v_kv);
+  return ok;
+}
+
 static bool rocm_graph_encode_decode_layer(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -1334,6 +1570,8 @@ static bool rocm_graph_encode_decode_layer(
     return false;
   const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
   const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+  if (!rocm_graph_engram_at_layer(g, model, layer, il, g->cur_hc, 1))
+    return false;
   const uint64_t q_rank = layer->attn_q_a->dim[1];
   const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
   const uint32_t n_groups = DS4_N_OUT_GROUP;
@@ -2682,6 +2920,9 @@ static bool rocm_graph_encode_layer_attention_batch(
   }
   if (!rocm_graph_reserve_compressed_position(
           g, il, static_cast<uint64_t>(pos0) + n_tokens))
+    return false;
+  if (!rocm_graph_engram_at_layer(g, model, layer, il, g->batch_cur_hc,
+                                  n_tokens))
     return false;
 
   /* Any published F16 activation mirror belongs to the previous layer, whose
@@ -4753,6 +4994,9 @@ static bool rocm_graph_eval_token_raw_swa(
     const bool profile = getenv("GUFO_DEEPSEEK_ROCM_GRAPH_TOKEN_PROFILE") != NULL;
     const double t0 = profile ? ds4_now_seconds() : 0.0;
 
+    const int32_t engram_token = (int32_t)token;
+    if (!rocm_graph_engram_prepare(g, model->map, &engram_token, 1, pos))
+      return false;
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = rocm_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL);
     const double t_encoded = profile ? ds4_now_seconds() : 0.0;
@@ -4849,6 +5093,12 @@ static bool rocm_graph_prefill_layer_major(
                                                  prompt,
                                                  start,
                                                  n_tokens);
+    if (ok) {
+      std::vector<int32_t> engram_toks(n_tokens);
+      for (uint32_t i = 0; i < n_tokens; ++i)
+        engram_toks[i] = (int32_t)prompt->v[start + i];
+      ok = rocm_graph_engram_prepare(g, model->map, engram_toks.data(), n_tokens, start);
+    }
     if (ok)
       ok = ds4_gpu_begin_commands() != 0;
     if (ok && logits && getenv("GUFO_DEEPSEEK_ROCM_NAN_PROBE")) {
@@ -5634,6 +5884,13 @@ static bool rocm_graph_verify_suffix(ds4_gpu_graph* g, const ds4_model* model,
                                               g->prefill_tokens, model, weights,
                                               tokens, start, n_tokens)) {
     return false;
+  }
+  {
+    std::vector<int32_t> engram_toks(n_tokens);
+    for (uint32_t i = 0; i < n_tokens; ++i)
+      engram_toks[i] = (int32_t)tokens->v[start + i];
+    if (!rocm_graph_engram_prepare(g, model->map, engram_toks.data(), n_tokens, start))
+      return false;
   }
 
   const uint64_t vocab_dim = weights->output->dim[1];

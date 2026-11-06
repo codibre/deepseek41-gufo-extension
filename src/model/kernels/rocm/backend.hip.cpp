@@ -98,6 +98,7 @@ struct ds4_gpu_tensor {
 #include "detail/ds4_rocm_moe.hip.hpp"
 
 #include "detail/ds4_rocm_moe_iq.hip.hpp"
+#include "detail/ds4_rocm_engram.hip.hpp"
 
 #include "detail/ds4_rocm_moe_launch.hip.hpp"
 
