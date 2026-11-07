@@ -121,15 +121,18 @@ __global__ static void moe_gate_up_mid_iq_kernel(
          * = 42, IQ2_XXS = 34): walk the row by real block size, not by 256. */
         const size_t blk_bytes = (size_t)(gate_row_bytes / k_blocks);
         float sumg = 0.f, sumu = 0.f;
+        float kg0 = 0.f, ku0 = 0.f;
         for (uint32_t kb = 0; kb < k_blocks; ++kb) {
             float wq[8], xv[8];
             const int base = (int)(kb * QK_K + lane * 8);
             ds4_iq_deq8(gate_type, gp + kb * blk_bytes, lane, wq);
+            if (kb == 0u && lane == 0) kg0 = wq[0];
 #pragma unroll
             for (int j = 0; j < 8; ++j) xv[j] = xrow[base + j];
 #pragma unroll
             for (int j = 0; j < 8; ++j) sumg = fmaf(wq[j], xv[j], sumg);
             ds4_iq_deq8(gate_type, up + kb * blk_bytes, lane, wq);
+            if (kb == 0u && lane == 0) ku0 = wq[0];
 #pragma unroll
             for (int j = 0; j < 8; ++j) sumu = fmaf(wq[j], xv[j], sumu);
         }
@@ -143,7 +146,17 @@ __global__ static void moe_gate_up_mid_iq_kernel(
                 if (upv < -clamp) upv = -clamp;
             }
             const float silu = gate / (1.0f + expf(-gate));
-            mid_out[(uint64_t)pair * expert_mid_dim + row] =
+            const float row_scale = 1.0f;
+    (void)row_scale;
+    static __device__ int krep_budget = 2;
+    if (krep_budget > 0 && pair == 0u && row < 2u) {
+      atomicAdd(&krep_budget, -1);
+      printf("KREP row %u kg0 %.7g ku0 %.7g gate %.7g upv %.7g x0 %.7g bytes %02x%02x%02x%02x%02x%02x%02x%02x\n",
+             row, kg0, ku0, gate, upv, xrow[0],
+             (uint8_t)gp[0], (uint8_t)gp[1], (uint8_t)gp[2], (uint8_t)gp[3],
+             (uint8_t)gp[4], (uint8_t)gp[5], (uint8_t)gp[6], (uint8_t)gp[7]);
+    }
+    mid_out[(uint64_t)pair * expert_mid_dim + row] =
                 silu * upv * weights[(uint64_t)tok * n_expert + slot];
         }
     }

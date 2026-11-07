@@ -61,7 +61,8 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc,
         uint32_t                sinkhorn_iters,
-        float                   eps) {
+        float                   eps,
+        const ds4_gpu_tensor   *pre, uint32_t pre_stride_f32) {
     if (!out || !split || !mix || !residual_hc || !model_map ||
         n_embd == 0 || n_hc != 4) {
         return 0;
@@ -91,7 +92,8 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
             (const float *)residual_hc->ptr,
             scale,
             base,
-            n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps);
+            n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps,
+            pre ? (const float *)pre->ptr : NULL, pre ? pre_stride_f32 : 0u);
     return hip_ok(hipGetLastError(), "hc split weighted sum launch");
 }
 /* Fused HC pre-block computation for the supported 4x4096 row and F16 GGUF
@@ -112,7 +114,8 @@ extern "C" int ds4_gpu_hc_norm_mix_split_weighted_sum_tensor(
         uint32_t                n_rows,
         uint32_t                sinkhorn_iters,
         float                   eps,
-        float                   norm_eps) {
+        float                   norm_eps,
+        const ds4_gpu_tensor   *pre, uint32_t pre_stride_f32) {
     /* Four tokens per workgroup, 256 lanes each, sixteen columns per lane.
      * More tokens amortize the 786 KiB projection weight over more rows and
      * fewer leave register room for a second resident workgroup; at 152 VGPRs
@@ -166,7 +169,8 @@ extern "C" int ds4_gpu_hc_norm_mix_split_weighted_sum_tensor(
             n_rows,
             sinkhorn_iters,
             eps,
-            norm_eps);
+            norm_eps,
+            pre ? (const float *)pre->ptr : NULL, pre ? pre_stride_f32 : 0u);
     return hip_ok(hipGetLastError(), "hc norm mix split weighted sum launch");
 }
 
@@ -187,7 +191,8 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         uint32_t                n_hc,
         uint32_t                sinkhorn_iters,
         float                   eps,
-        float                   norm_eps) {
+        float                   norm_eps,
+        const ds4_gpu_tensor   *pre, uint32_t pre_stride_f32) {
     if (!out || !norm_out || !split || !mix || !residual_hc || !model_map ||
         n_embd == 0 || n_hc != 4) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
@@ -235,7 +240,8 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
                     (float *)out->ptr, (float *)norm_out->ptr, q8, q8_scale,
                     norm_q8k ? (hip_block_q8_K *)norm_q8k->ptr : NULL, (float *)split->ptr,
                     (const float *)mix->ptr, (const float *)residual_hc->ptr, scale, base, norm_w,
-                    n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
+                    n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps,
+                    pre ? (const float *)pre->ptr : NULL, pre ? pre_stride_f32 : 0u);
         } else {
             /* Wide rows (e.g. V4.1 n_embd 5120): fused kernel in F32-only
              * form, then a standalone pass quantizes the normalized row. */
@@ -243,7 +249,8 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
                     (float *)out->ptr, (float *)norm_out->ptr, NULL, NULL, NULL,
                     (float *)split->ptr, (const float *)mix->ptr,
                     (const float *)residual_hc->ptr, scale, base, norm_w,
-                    n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
+                    n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps,
+                    pre ? (const float *)pre->ptr : NULL, pre ? pre_stride_f32 : 0u);
             if (hip_ok(hipGetLastError(), "hc split weighted sum norm launch")) {
                 q8_0_act_quantize_kernel<<<(uint32_t)n_rows, 256>>>(
                         (const float *)norm_out->ptr, q8, q8_scale,
@@ -266,7 +273,8 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
             scale,
             base,
             norm_w,
-            n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
+            n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps,
+            pre ? (const float *)pre->ptr : NULL, pre ? pre_stride_f32 : 0u);
     return hip_ok(hipGetLastError(), "hc split weighted sum norm launch");
 }
 extern "C" int ds4_gpu_output_hc_weights_tensor(

@@ -1027,6 +1027,16 @@ extern "C" uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
     return tensor ? tensor->bytes : 0;
 }
 
+__global__ static void hc_pre_onehot_kernel(float *dst, uint32_t n_rows) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_rows * 4u) dst[i] = (i % 4u) == 0u ? 1.0f : 0.0f;
+}
+extern "C" int ds4_gpu_hc_pre_onehot(ds4_gpu_tensor *tensor, uint32_t n_rows) {
+    if (!tensor || tensor->bytes < (uint64_t)n_rows * 24u * sizeof(float)) return 0;
+    hc_pre_onehot_kernel<<<(n_rows * 24u + 255u) / 256u, 256>>>((float *)tensor->ptr, n_rows);
+    return hip_ok(hipGetLastError(), "hc pre onehot launch");
+}
+
 extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
     if (!tensor || count > tensor->bytes / sizeof(float)) return 0;
     if (count == 0) return 1;

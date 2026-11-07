@@ -2116,7 +2116,8 @@ __global__ static void attention_output_a_q5_k_kernel(
     const uint32_t t = tg / n_groups;
     const uint32_t g = tg % n_groups;
     const block_q5_K *b =
-        (const block_q5_K *)(wa + (uint64_t)r * in_blocks * sizeof(block_q5_K));
+        (const block_q5_K *)(wa + ((uint64_t)g * rank + r) * in_blocks *
+                                         sizeof(block_q5_K));
     const float *xr = heads + (uint64_t)t * n_groups * group_dim +
                       (uint64_t)g * group_dim;
     float acc = 0.0f;

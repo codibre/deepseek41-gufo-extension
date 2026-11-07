@@ -535,6 +535,28 @@ static int routed_moe_launch(
     /* Generic IQ-family route: the weights stay exactly as the GGUF stored
      * them and the fp32 activations are dotted against in-register
      * dequantized groups — no staging copies anywhere. */
+    static int g0_iq_probe_once = 1;
+    if (g0_iq_probe_once && n_tokens == 1 && getenv("DS4_GOLDEN0")) {
+      g0_iq_probe_once = 0;
+      fprintf(stderr,
+              "ds4: g0[iq] gate_off %llu row %llu exp %llu gt %u down_off "
+              "%llu drow %llu dt %u\n",
+              (unsigned long long)gate_offset,
+              (unsigned long long)gate_row_bytes,
+              (unsigned long long)gate_expert_bytes, gate_type,
+              (unsigned long long)down_offset,
+              (unsigned long long)down_row_bytes, down_type);
+      fprintf(stderr, "ds4: g0[iqw] gate %02x%02x%02x%02x%02x%02x%02x%02x up "
+              "%02x%02x%02x%02x%02x%02x%02x%02x down %02x%02x%02x%02x%02x%02x%02x%02x\n",
+              (uint8_t)gate_w[0], (uint8_t)gate_w[1], (uint8_t)gate_w[2],
+              (uint8_t)gate_w[3], (uint8_t)gate_w[4], (uint8_t)gate_w[5],
+              (uint8_t)gate_w[6], (uint8_t)gate_w[7], (uint8_t)up_w[0],
+              (uint8_t)up_w[1], (uint8_t)up_w[2], (uint8_t)up_w[3],
+              (uint8_t)up_w[4], (uint8_t)up_w[5], (uint8_t)up_w[6],
+              (uint8_t)up_w[7], (uint8_t)down_w[0], (uint8_t)down_w[1],
+              (uint8_t)down_w[2], (uint8_t)down_w[3], (uint8_t)down_w[4],
+              (uint8_t)down_w[5], (uint8_t)down_w[6], (uint8_t)down_w[7]);
+    }
     const uint32_t pair_count = n_tokens * n_expert;
     const unsigned iq_threads = 256u;
     dim3 iq_gate_up((expert_mid_dim + 7u) / 8u, pair_count, 1u);

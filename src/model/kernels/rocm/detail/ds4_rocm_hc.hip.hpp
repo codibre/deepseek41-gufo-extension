@@ -55,7 +55,12 @@ __device__ static void hc4_split_one(float *out, const float *mix, const float *
             for (int r = 0; r < 4; r++) c[r * 4 + col] /= s;
         }
     }
-    for (int i = 0; i < 16; i++) out[8 + i] = c[i];
+    /* Expand kernels consume comb as [src][dst]
+     * (x2[dst] = post[dst]*y + sum_src comb[src*n_hc+dst]*res[src]), while
+     * the Sinkhorn above follows the reference layout comb_frag[dst][src].
+     * Store the transpose so every expand reads the reference orientation. */
+    for (int r = 0; r < 4; r++)
+        for (int col = 0; col < 4; col++) out[8 + col * 4 + r] = c[r * 4 + col];
 }
 
 __global__ static void hc_weighted_sum_kernel(float *out, const float *x, const float *w, uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens, uint32_t weight_stride_f32) {
@@ -333,7 +338,8 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
         uint32_t n_hc,
         uint32_t n_rows,
         uint32_t sinkhorn_iters,
-        float epsv) {
+        float epsv,
+        const float *pre, uint32_t pre_stride_f32) {
     uint32_t t = blockIdx.x;
     uint32_t d = threadIdx.x;
     if (t >= n_rows || n_hc != 4) return;
@@ -341,13 +347,19 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
     float *sp = split + (uint64_t)t * mix_hc;
     if (d == 0) hc4_split_one(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv);
     __syncthreads();
+    /* Official Block.forward collapses the streams for this sublayer with the
+     * PRE carried from the previous sublayer, not with this sublayer's own
+     * pre (attention uses the previous FFN's pre; FFN uses this attention's
+     * pre).  `pre` overrides sp[0..3]; stride 0 keeps the legacy same-split
+     * weights. */
+    const float *pw = pre ? (pre + (uint64_t)t * pre_stride_f32) : sp;
     /* Four adjacent lanes per thread; see hc_expand4_vec4_kernel for why the
      * scalar form leaves bandwidth on the table. Same per-element sum over the
      * same four slots in the same order, so the output is bit-identical. */
     const uint64_t rbase = (uint64_t)t * 4u * n_embd;
     const uint64_t obase = (uint64_t)t * n_embd;
     if ((n_embd & 3u) == 0u) {
-        const float s0 = sp[0], s1 = sp[1], s2 = sp[2], s3 = sp[3];
+        const float s0 = pw[0], s1 = pw[1], s2 = pw[2], s3 = pw[3];
         for (uint32_t col = d * 4u; col < n_embd; col += blockDim.x * 4u) {
             const float4 v0 = *reinterpret_cast<const float4 *>(residual_hc + rbase + 0u * (uint64_t)n_embd + col);
             const float4 v1 = *reinterpret_cast<const float4 *>(residual_hc + rbase + 1u * (uint64_t)n_embd + col);
@@ -365,7 +377,7 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
     for (uint32_t col = d; col < n_embd; col += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t h = 0; h < 4; h++) {
-            acc += residual_hc[rbase + (uint64_t)h * n_embd + col] * sp[h];
+            acc += residual_hc[rbase + (uint64_t)h * n_embd + col] * pw[h];
         }
         out[obase + col] = acc;
     }
@@ -393,7 +405,8 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         uint32_t n_rows,
         uint32_t sinkhorn_iters,
         float epsv,
-        float norm_eps) {
+        float norm_eps,
+        const float *pre, uint32_t pre_stride_f32) {
     const uint32_t t = blockIdx.x;
     const uint32_t d = threadIdx.x;
     if (t >= n_rows || n_hc != 4) return;
@@ -401,12 +414,16 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
     float *sp = split + (uint64_t)t * mix_hc;
     if (d == 0) hc4_split_one(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv);
     __syncthreads();
+    /* See hc_split_weighted_sum_fused_kernel: the collapse weights are the PRE
+     * carried from the previous sublayer (attention <- previous FFN, FFN <-
+     * this attention); split itself is still written for the post-expand. */
+    const float *pw = pre ? (pre + (uint64_t)t * pre_stride_f32) : sp;
 
     float sum = 0.0f;
     for (uint32_t col = d; col < n_embd; col += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t h = 0; h < 4; h++) {
-            acc += residual_hc[(uint64_t)t * 4u * n_embd + (uint64_t)h * n_embd + col] * sp[h];
+            acc += residual_hc[(uint64_t)t * 4u * n_embd + (uint64_t)h * n_embd + col] * pw[h];
         }
         out[(uint64_t)t * n_embd + col] = acc;
         sum += acc * acc;
@@ -488,7 +505,8 @@ __global__ static void hc4_norm_mix_split_weighted_sum_kernel(
         uint32_t n_rows,
         uint32_t sinkhorn_iters,
         float epsv,
-        float norm_eps) {
+        float norm_eps,
+        const float *pre, uint32_t pre_stride_f32) {
     constexpr uint32_t MIX_HC = 24u;
     constexpr uint32_t WAVES_PER_TOK = TPT / 32u;
     const uint32_t tl = threadIdx.x / TPT;
@@ -581,8 +599,11 @@ __global__ static void hc4_norm_mix_split_weighted_sum_kernel(
     }
 
     if (!active) return;
-    const float s0 = splitbuf[tl][0], s1 = splitbuf[tl][1];
-    const float s2 = splitbuf[tl][2], s3 = splitbuf[tl][3];
+    /* Collapse weights may be carried from the previous sublayer (see
+     * hc_split_weighted_sum_fused_kernel); split_out is still this sublayer's. */
+    const float *pw = pre ? (pre + (uint64_t)t * pre_stride_f32) : splitbuf[tl];
+    const float s0 = pw[0], s1 = pw[1];
+    const float s2 = pw[2], s3 = pw[3];
     float *orow = out + (uint64_t)t * n_embd + col0;
 #pragma unroll
     for (uint32_t c = 0; c < COLS; c += 4u) {

@@ -120,8 +120,10 @@ int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor* out_hc,
 /* norm_q8 may be NULL; when set it also receives norm_out's Q8_0 form
  * (ds4_gpu_q8_0_act_bytes per row), and norm_q8k, if also set, its Q8_K form
  * (ds4_gpu_q8_K_act_bytes per row). Quantized outputs need n_embd == 4096. */
-int ds4_gpu_hc_split_weighted_sum_norm_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *norm_out, ds4_gpu_tensor *norm_q8, ds4_gpu_tensor *norm_q8k, ds4_gpu_tensor *split, const ds4_gpu_tensor *mix, const ds4_gpu_tensor *residual_hc, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint64_t norm_weight_offset, uint32_t n_embd, uint32_t n_hc, uint32_t sinkhorn_iters, float eps, float norm_eps);
-int ds4_gpu_hc_split_weighted_sum_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *split, const ds4_gpu_tensor *mix, const ds4_gpu_tensor *residual_hc, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_embd, uint32_t n_hc, uint32_t sinkhorn_iters, float eps);
+int ds4_gpu_hc_split_weighted_sum_norm_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *norm_out, ds4_gpu_tensor *norm_q8, ds4_gpu_tensor *norm_q8k, ds4_gpu_tensor *split, const ds4_gpu_tensor *mix, const ds4_gpu_tensor *residual_hc, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint64_t norm_weight_offset, uint32_t n_embd, uint32_t n_hc, uint32_t sinkhorn_iters, float eps, float norm_eps,
+                                     const ds4_gpu_tensor *pre, uint32_t pre_stride_f32);
+int ds4_gpu_hc_split_weighted_sum_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *split, const ds4_gpu_tensor *mix, const ds4_gpu_tensor *residual_hc, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_embd, uint32_t n_hc, uint32_t sinkhorn_iters, float eps,
+                               const ds4_gpu_tensor *pre, uint32_t pre_stride_f32);
 /* The whole pre-block chain -- norm, mix projection, split, weighted sum -- in
  * one pass over the hyper-connection row. Returns 0 when the shape does not fit
  * the register tiling, so the caller keeps the separate chain. */
@@ -130,7 +132,8 @@ int ds4_gpu_hc_norm_mix_split_weighted_sum_tensor(
     const ds4_gpu_tensor* residual_hc, const void* model_map,
     uint64_t model_size, uint64_t mix_weight_offset, uint64_t scale_offset,
     uint64_t base_offset, uint32_t n_embd, uint32_t n_hc, uint32_t n_rows,
-    uint32_t sinkhorn_iters, float eps, float norm_eps);
+    uint32_t sinkhorn_iters, float eps, float norm_eps,
+    const ds4_gpu_tensor* pre, uint32_t pre_stride_f32);
 int ds4_gpu_hc_weighted_sum_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc);
 int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps);
 /* Head RMS norm followed by the RoPE tail at pos0 + token, bit-identical to
@@ -283,6 +286,9 @@ uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset, const ds4_gpu_tensor *src, uint64_t src_offset, uint64_t bytes);
 int ds4_gpu_tensor_convert_f32_to_f16(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t count);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
+/* Fill `tensor` with n_rows rows of 24 floats, each row one-hot [1,0,0,0]:
+ * the identity pre-mix that layer 0's attention collapses with. */
+int ds4_gpu_hc_pre_onehot(ds4_gpu_tensor *tensor, uint32_t n_rows);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
 /// Reads a completed, frozen session without joining unrelated execution.
