@@ -2141,7 +2141,15 @@ extern "C" int ds4_gpu_attention_output_a_q5_k_tensor(
     }
     const uint64_t in_blocks = group_dim / QK_K;
     uint64_t weight_bytes = 0;
-    if (!hip_u64_mul_checked(rank, in_blocks * sizeof(block_q5_K),
+    /* The kernel indexes rows as (g * rank + r) across ALL n_groups groups
+     * (the GGUF stores wo_a concatenated per group), so the registered
+     * range must cover n_groups * rank rows — not just one group's rank.
+     * A per-group bound here handed the kernel an arena that ran out after
+     * group 0: groups 1..7 read zero/garbage past the upload, producing an
+     * output that still correlated ~0.9 with the true projection but at
+     * ~1/7th scale with dead rows. */
+    if (!hip_u64_mul_checked((uint64_t)n_groups * rank,
+                             in_blocks * sizeof(block_q5_K),
                              &weight_bytes)) {
         return 0;
     }

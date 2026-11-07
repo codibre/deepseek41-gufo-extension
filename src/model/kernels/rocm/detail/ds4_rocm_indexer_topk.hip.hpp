@@ -728,3 +728,172 @@ extern "C" int ds4_gpu_indexer_apply_mask_tensor(ds4_gpu_tensor *scores,
                                              (const float *)mask->ptr, n_comp);
   return hip_ok(hipGetLastError(), "cand apply");
 }
+
+/* ------------------------------------------------------------------------
+ * V4.1 source sharing: batched candidate masking for prefill chunks.
+ *
+ * The decode entry above masks one query row.  A prefill chunk needs one
+ * mask per token (each token has its own block ranking and its own causal
+ * reach), so this variant keeps the identical single-workgroup algorithm
+ * and grids it over `blockIdx.y == token`.  The mask additionally zeroes
+ * rows beyond the token's causal reach, so applying it leaves every
+ * remaining score finite.
+ * ---------------------------------------------------------------------- */
+__global__ static void indexer_candidate_mask_visible_fill_kernel(
+    float *mask, uint32_t n_comp, uint32_t pos0, uint32_t ratio) {
+  float *m = mask + (uint64_t)blockIdx.y * n_comp;
+  uint32_t reach = (pos0 + blockIdx.y + 1u) / (ratio ? ratio : 1u);
+  if (reach > n_comp) reach = n_comp;
+  for (uint32_t c = threadIdx.x; c < n_comp; c += blockDim.x)
+    m[c] = (c < reach) ? 1.0f : 0.0f;
+}
+
+__global__ static void indexer_candidate_mask_batch_kernel(
+    const float *scores, uint32_t n_comp, uint32_t pos0, uint32_t ratio,
+    uint32_t block_size, uint32_t top_k_blocks, float *mask) {
+  __shared__ uint32_t bs[DS4_CAND_MAX_BLOCKS];
+  const uint32_t t = blockIdx.y;
+  scores += (uint64_t)t * n_comp;
+  mask += (uint64_t)t * n_comp;
+  uint32_t n_reach = (pos0 + t + 1u) / (ratio ? ratio : 1u);
+  if (n_reach > n_comp) n_reach = n_comp;
+  if (n_reach == 0u) {
+    for (uint32_t i = threadIdx.x; i < n_comp; i += blockDim.x) mask[i] = 0.0f;
+    return;
+  }
+  const uint32_t n_blocks = (n_reach + block_size - 1u) / block_size;
+  for (uint32_t i = threadIdx.x; i < DS4_CAND_MAX_BLOCKS; i += blockDim.x)
+    bs[i] = 0u; /* == monotonic(-inf) */
+  __syncthreads();
+  for (uint32_t b = threadIdx.x; b < n_blocks; b += blockDim.x) {
+    const uint32_t lo = b * block_size;
+    const uint32_t hi = min(lo + block_size, n_reach);
+    float m = -INFINITY;
+    for (uint32_t c = lo; c < hi; c++) {
+      const float v = scores[c];
+      if (v > m) m = v;
+    }
+    bs[b] = cand_monotonic(m);
+  }
+  __syncthreads();
+  const uint32_t k = min(top_k_blocks, n_blocks);
+  __shared__ uint32_t red[256];
+  __shared__ uint32_t total;
+  uint32_t cnt = 0u;
+  for (uint32_t i = threadIdx.x; i < n_blocks; i += blockDim.x)
+    if (bs[i] > cnt) cnt = bs[i];
+  red[threadIdx.x] = cnt;
+  __syncthreads();
+  if (threadIdx.x == 0u) {
+    uint32_t mx = 0u;
+    for (uint32_t i = 0; i < blockDim.x; i++)
+      if (red[i] > mx) mx = red[i];
+    total = mx;
+  }
+  __syncthreads();
+  uint32_t lo_k = 0u, hi_k = total;
+  while (lo_k < hi_k) {
+    const uint32_t mid = lo_k + (hi_k - lo_k + 1u) / 2u;
+    cnt = 0u;
+    for (uint32_t i = threadIdx.x; i < n_blocks; i += blockDim.x)
+      if (bs[i] >= mid) cnt++;
+    red[threadIdx.x] = cnt;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+      uint32_t s = 0u;
+      for (uint32_t i = 0; i < blockDim.x; i++) s += red[i];
+      total = s;
+    }
+    __syncthreads();
+    cnt = total;
+    __syncthreads();
+    if (cnt >= k) lo_k = mid;
+    else hi_k = mid - 1u;
+  }
+  const uint32_t pinned = (n_reach - 1u) / block_size;
+  for (uint32_t c = threadIdx.x; c < n_comp; c += blockDim.x)
+    mask[c] = (c < n_reach && (c / block_size == pinned || bs[c / block_size] >= lo_k))
+                  ? 1.0f
+                  : 0.0f;
+}
+
+extern "C" int ds4_gpu_indexer_candidate_mask_batch_tensor(
+    const ds4_gpu_tensor *scores, uint32_t n_comp, uint32_t n_tokens,
+    uint32_t pos0, uint32_t ratio, uint32_t block_size, uint32_t top_k_blocks,
+    ds4_gpu_tensor *mask) {
+  if (!scores || !mask || n_comp == 0u || n_tokens == 0u || ratio == 0u ||
+      block_size == 0u || top_k_blocks == 0u ||
+      !hip_tensor_has_f32(scores, (uint64_t)n_tokens * n_comp) ||
+      !hip_tensor_has_f32(mask, (uint64_t)n_tokens * n_comp))
+    return 0;
+  const uint32_t n_blocks_max = (n_comp + block_size - 1u) / block_size;
+  if (n_blocks_max == 0u) return 0;
+  if (n_blocks_max > DS4_CAND_MAX_BLOCKS) {
+    /* Same fallback as the decode entry: every causally-visible row is a
+     * candidate (plain top-k over the visible prefix). */
+    dim3 grid(1, n_tokens, 1);
+    indexer_candidate_mask_visible_fill_kernel<<<grid, 256>>>(
+        (float *)mask->ptr, n_comp, pos0, ratio);
+    return hip_ok(hipGetLastError(), "cand mask visible fill");
+  }
+  dim3 grid(1, n_tokens, 1);
+  indexer_candidate_mask_batch_kernel<<<grid, 256>>>(
+      (const float *)scores->ptr, n_comp, pos0, ratio, block_size,
+      top_k_blocks, (float *)mask->ptr);
+  return hip_ok(hipGetLastError(), "cand mask batch launch");
+}
+
+__global__ static void indexer_apply_mask_batch_kernel(float *scores,
+                                                       const float *mask,
+                                                       uint32_t n_comp) {
+  float *s = scores + (uint64_t)blockIdx.y * n_comp;
+  const float *m = mask + (uint64_t)blockIdx.y * n_comp;
+  for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < n_comp;
+       c += blockDim.x * gridDim.x)
+    if (m[c] <= 0.0f) s[c] = -INFINITY;
+}
+
+extern "C" int ds4_gpu_indexer_apply_mask_batch_tensor(
+    ds4_gpu_tensor *scores, uint32_t n_comp, uint32_t n_tokens,
+    const ds4_gpu_tensor *mask) {
+  if (!scores || !mask || n_comp == 0u || n_tokens == 0u ||
+      !hip_tensor_has_f32(scores, (uint64_t)n_tokens * n_comp) ||
+      !hip_tensor_has_f32(mask, (uint64_t)n_tokens * n_comp))
+    return 0;
+  dim3 grid((n_comp + 255u) / 256u, n_tokens, 1);
+  indexer_apply_mask_batch_kernel<<<grid, 256>>>((float *)scores->ptr,
+                                                 (const float *)mask->ptr,
+                                                 n_comp);
+  return hip_ok(hipGetLastError(), "cand apply batch");
+}
+
+/* V4.1: after top-k, any selected slot whose score is -inf (causal or
+ * candidate padding when fewer than top_k rows are live) becomes the
+ * 0xffffffff sentinel, which the indexed attention drops.  Without this,
+ * -inf ties would emit duplicate early rows that attention's `ci <
+ * visible_comp` filter cannot distinguish.  Used only on the V4.1 shared
+ * path; legacy V3 behaviour is unchanged. */
+__global__ static void indexer_topk_drop_neginf_kernel(uint32_t *selected,
+                                                       const float *scores,
+                                                       uint32_t n_comp,
+                                                       uint32_t top_k) {
+  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= top_k) return;
+  const uint64_t idx = (uint64_t)blockIdx.y * top_k + i;
+  const uint32_t row = selected[idx];
+  if (row < n_comp && scores[(uint64_t)blockIdx.y * n_comp + row] == -INFINITY)
+    selected[idx] = 0xffffffffu;
+}
+
+extern "C" int ds4_gpu_indexer_topk_drop_neginf_tensor(
+    ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores, uint32_t n_comp,
+    uint32_t n_tokens, uint32_t top_k) {
+  if (!selected || !scores || n_comp == 0u || n_tokens == 0u || top_k == 0u ||
+      !hip_tensor_has_f32(scores, (uint64_t)n_tokens * n_comp) ||
+      selected->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t))
+    return 0;
+  dim3 grid(top_k, n_tokens, 1);
+  indexer_topk_drop_neginf_kernel<<<grid, 256>>>(
+      (uint32_t *)selected->ptr, (const float *)scores->ptr, n_comp, top_k);
+  return hip_ok(hipGetLastError(), "topk drop -inf");
+}

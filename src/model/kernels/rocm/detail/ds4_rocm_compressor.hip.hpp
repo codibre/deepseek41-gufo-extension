@@ -513,7 +513,8 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
         float                   beta_fast,
         float                   beta_slow,
         float                   rms_eps,
-        ds4_gpu_tensor       *comp_mirror_f16) {
+        ds4_gpu_tensor       *comp_mirror_f16,
+        ds4_gpu_tensor       *latent_out) {
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
         !hip_compressor_shape_supported(head_dim, ratio) || n_tokens == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
@@ -539,6 +540,9 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
         !hip_tensor_has_bytes(kv, kv_bytes) || !hip_tensor_has_bytes(sc, kv_bytes) ||
         !hip_tensor_has_bytes(state_kv, state_bytes) || !hip_tensor_has_bytes(state_score, state_bytes) ||
         (n_comp && !hip_tensor_has_bytes(comp_cache, comp_bytes)) ||
+        (latent_out && n_comp != 0u &&
+         !hip_tensor_has_bytes(latent_out,
+                               (uint64_t)n_comp * head_dim * sizeof(float))) ||
         (comp_mirror_f16 &&
          !hip_tensor_has_elems2(
                  comp_mirror_f16, n_comp, head_dim, sizeof(half)))) {
@@ -595,6 +599,28 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
         if (!ds4_gpu_rms_norm_weight_rows_tensor(comp_cache, comp_cache,
                                                    model_map, model_size, norm_offset,
                                                    head_dim, n_comp, rms_eps)) return 0;
+        if (latent_out && n_comp != 0u) {
+
+            /* V4.1: the indexer projects from the post-norm, pre-rope pooled
+
+             * row — copy it out before rope rotates comp rows and fp8
+
+             * quantization truncates them (matches the decode replay's
+
+             * latent staging into job.latent_out).
+
+             */
+
+            if (hipMemcpyAsync(latent_out->ptr, comp_cache->ptr,
+
+                               (size_t)n_comp * head_dim * sizeof(float),
+
+                               hipMemcpyDeviceToDevice, 0) != hipSuccess)
+
+                return 0;
+
+        }
+
         if (n_rot != 0 && !hip_rope_tail_stride_tensor(comp_cache, n_comp, 1, head_dim,
                                                          n_rot, pos0, ratio, n_ctx_orig, false,
                                                          freq_base, freq_scale, ext_factor,
@@ -638,7 +664,8 @@ extern "C" int ds4_gpu_compressor_prefill_replay_tensor(
         float                   beta_fast,
         float                   beta_slow,
         float                   rms_eps,
-        ds4_gpu_tensor       *comp_mirror_f16) {
+        ds4_gpu_tensor       *comp_mirror_f16,
+        ds4_gpu_tensor       *latent_out) {
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
         !hip_compressor_shape_supported(head_dim, ratio) || n_tokens == 0 ||
         n_tokens % ratio != 0 || pos0 % ratio != 0 ||
@@ -662,6 +689,9 @@ extern "C" int ds4_gpu_compressor_prefill_replay_tensor(
         !hip_tensor_has_bytes(kv, kv_bytes) || !hip_tensor_has_bytes(sc, kv_bytes) ||
         !hip_tensor_has_bytes(state_kv, state_bytes) || !hip_tensor_has_bytes(state_score, state_bytes) ||
         !hip_tensor_has_bytes(comp_cache, comp_bytes) ||
+        (latent_out &&
+         !hip_tensor_has_bytes(latent_out,
+                               (uint64_t)n_comp * head_dim * sizeof(float))) ||
         (comp_mirror_f16 &&
          !hip_tensor_has_elems2(
                  comp_mirror_f16, n_comp, head_dim, sizeof(half)))) {
@@ -681,6 +711,28 @@ extern "C" int ds4_gpu_compressor_prefill_replay_tensor(
     if (!ds4_gpu_rms_norm_weight_rows_tensor(comp_cache, comp_cache,
                                                model_map, model_size, norm_offset,
                                                head_dim, n_comp, rms_eps)) return 0;
+    if (latent_out && n_comp != 0u) {
+
+        /* V4.1: the indexer projects from the post-norm, pre-rope pooled
+
+         * row — copy it out before rope rotates comp rows and fp8
+
+         * quantization truncates them (matches the decode replay's
+
+         * latent staging into job.latent_out).
+
+         */
+
+        if (hipMemcpyAsync(latent_out->ptr, comp_cache->ptr,
+
+                           (size_t)n_comp * head_dim * sizeof(float),
+
+                           hipMemcpyDeviceToDevice, 0) != hipSuccess)
+
+            return 0;
+
+    }
+
     if (n_rot != 0 && !hip_rope_tail_stride_tensor(comp_cache, n_comp, 1, head_dim,
                                                      n_rot, pos0, ratio, n_ctx_orig, false,
                                                      freq_base, freq_scale, ext_factor,

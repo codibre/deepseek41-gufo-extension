@@ -65,9 +65,9 @@ int ds4_gpu_compressor_store_batch_tensor(
     uint32_t n_tokens);
 // Pools the whole windows that start at pos0 in kv and sc, continuing from the
 // state's previous window, and leaves the state as per-window updates would.
-int ds4_gpu_compressor_prefill_replay_tensor(ds4_gpu_tensor *comp_cache, ds4_gpu_tensor *state_kv, ds4_gpu_tensor *state_score, const ds4_gpu_tensor *kv, const ds4_gpu_tensor *sc, const void *model_map, uint64_t model_size, uint64_t ape_offset, uint32_t ape_type, uint64_t norm_offset, uint32_t norm_type, uint32_t head_dim, uint32_t ratio, uint32_t pos0, uint32_t n_tokens, uint32_t n_rot, uint32_t n_ctx_orig, bool quantize_fp8, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float rms_eps, ds4_gpu_tensor *comp_mirror_f16);
+int ds4_gpu_compressor_prefill_replay_tensor(ds4_gpu_tensor *comp_cache, ds4_gpu_tensor *state_kv, ds4_gpu_tensor *state_score, const ds4_gpu_tensor *kv, const ds4_gpu_tensor *sc, const void *model_map, uint64_t model_size, uint64_t ape_offset, uint32_t ape_type, uint64_t norm_offset, uint32_t norm_type, uint32_t head_dim, uint32_t ratio, uint32_t pos0, uint32_t n_tokens, uint32_t n_rot, uint32_t n_ctx_orig, bool quantize_fp8, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float rms_eps, ds4_gpu_tensor *comp_mirror_f16, ds4_gpu_tensor *latent_out);
 int ds4_gpu_compressor_prefill_state_ratio4_tensor(ds4_gpu_tensor *state_kv, ds4_gpu_tensor *state_score, const ds4_gpu_tensor *kv_tail, const ds4_gpu_tensor *sc_tail, const void *model_map, uint64_t model_size, uint64_t ape_offset, uint32_t ape_type, uint32_t head_dim, uint32_t pos0);
-int ds4_gpu_compressor_prefill_tensor(ds4_gpu_tensor *comp_cache, ds4_gpu_tensor *state_kv, ds4_gpu_tensor *state_score, const ds4_gpu_tensor *kv, const ds4_gpu_tensor *sc, const void *model_map, uint64_t model_size, uint64_t ape_offset, uint32_t ape_type, uint64_t norm_offset, uint32_t norm_type, uint32_t head_dim, uint32_t ratio, uint32_t pos0, uint32_t n_tokens, uint32_t n_rot, uint32_t n_ctx_orig, bool quantize_fp8, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float rms_eps, ds4_gpu_tensor *comp_mirror_f16);
+int ds4_gpu_compressor_prefill_tensor(ds4_gpu_tensor *comp_cache, ds4_gpu_tensor *state_kv, ds4_gpu_tensor *state_score, const ds4_gpu_tensor *kv, const ds4_gpu_tensor *sc, const void *model_map, uint64_t model_size, uint64_t ape_offset, uint32_t ape_type, uint64_t norm_offset, uint32_t norm_type, uint32_t head_dim, uint32_t ratio, uint32_t pos0, uint32_t n_tokens, uint32_t n_rot, uint32_t n_ctx_orig, bool quantize_fp8, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float rms_eps, ds4_gpu_tensor *comp_mirror_f16, ds4_gpu_tensor *latent_out);
 /* One compressor of a single-token decode step. */
 struct ds4_gpu_compressor_step {
     const ds4_gpu_tensor *kv;      /* this token's coff * head_dim values */
@@ -201,6 +201,20 @@ int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
  * ds4_gpu_rope_tail_tensor followed by the projection's own quantize pass. */
 int ds4_gpu_rope_tail_quantize_q8_0_tensor(ds4_gpu_tensor *x, ds4_gpu_tensor *xq8, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow);
 int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow);
+
+/* V4.1 source sharing: stride-rope for batched owner index-K rows. */
+int ds4_gpu_rope_tail_stride_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t pos_stride, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow);
+
+/* V4.1 source sharing: per-token candidate block masks over a prefill chunk
+ * (mask layout: n_tokens x n_comp f32; masks also clear rows beyond each
+ * token's causal reach) and the matching apply pass. */
+int ds4_gpu_indexer_candidate_mask_batch_tensor(const ds4_gpu_tensor *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t pos0, uint32_t ratio, uint32_t block_size, uint32_t top_k_blocks, ds4_gpu_tensor *mask);
+int ds4_gpu_indexer_apply_mask_batch_tensor(ds4_gpu_tensor *scores, uint32_t n_comp, uint32_t n_tokens, const ds4_gpu_tensor *mask);
+
+/* V4.1: rewrite -inf-padded top-k slots to the 0xffffffff sentinel that
+ * indexed attention drops (V4.1 shared path only). */
+int ds4_gpu_indexer_topk_drop_neginf_tensor(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k);
+
 int ds4_gpu_routed_moe_batch_tensor(
     ds4_gpu_tensor* out, ds4_gpu_tensor* gate, ds4_gpu_tensor* up,
     ds4_gpu_tensor* mid, ds4_gpu_tensor* experts, const void* model_map,
