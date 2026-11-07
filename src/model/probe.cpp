@@ -4,6 +4,8 @@
 #include <exception>
 #include <filesystem>
 
+#include "gufo/ext/sampling.hpp"
+#include "gufo/ext/text.hpp"
 #include "model/gguf/ds41_reader.hpp"
 
 namespace gufo::models::deepseek41 {
@@ -42,8 +44,26 @@ bool ProbeDeepSeek41(std::string_view model_root) {
   return IsDeepSeek41(std::string(model_root));
 }
 
-bool ClaimDeepSeek41File(const std::string& model_path) {
-  return IsDeepSeek41(model_path);
+bool ProbeDeepSeek41Gguf(const gufo::core::GgufReader& reader) {
+  // Reached only for files core opened with allow_unsized_tensors (the fused
+  // IQ2_XXS expert slabs of this container). Architecture is the gate; the
+  // engine reads tensor bytes via Ds41Reader, never the core tensor table.
+  return reader.GetMetadataString("general.architecture").value_or("") ==
+         "deepseek41";
 }
 
 }  // namespace gufo::models::deepseek41
+
+namespace gufo::models::deepseek_v4_flash {
+
+std::optional<gufo::sampling::TextSamplingDefaults> DeepSeekSamplingDefaults() {
+  return gufo::sampling::PresetDefaults(
+      gufo::sampling::TextModelPreset::kDeepSeekV4Flash);
+}
+
+std::optional<gufo::sampling::TextSamplingDefaults> DeepSeekSamplingDefaults(
+    const gufo::core::GgufReader&) {
+  return DeepSeekSamplingDefaults();
+}
+
+}  // namespace gufo::models::deepseek_v4_flash

@@ -67,6 +67,8 @@ gufo_extension_target(
     src/model/drivers.cpp
     src/model/tool_calls.cpp
     src/model/continuation_identity.cpp
+    src/model/continuation_adapter.cpp
+    src/model/continuation_layout.cpp
     src/model/provider.cpp
     src/model/runtime/model_data.cpp
     src/model/runtime/rocm_graph.cpp

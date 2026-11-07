@@ -643,14 +643,9 @@ static std::optional<gufo::ReasoningEffort> ParseReasoningEffort(
 static gufo::ReasoningOptions PromptReasoningOptions(
     const ext::TextPromptOptions& options) {
   gufo::ReasoningOptions reasoning;
-  if (options.reasoning_mode == "on") {
-    reasoning.enabled = true;
-  } else if (options.reasoning_mode == "off") {
-    reasoning.enabled = false;
-  }
+  reasoning.enabled = options.thinking_mode();
   if (options.reasoning_effort != "auto") {
     reasoning.effort = ParseReasoningEffort(options.reasoning_effort);
-    reasoning.enabled = true;
   }
   if (options.preserve_thinking == "on") {
     reasoning.preserve_thinking = true;
@@ -669,14 +664,12 @@ static std::shared_ptr<models::deepseek_v4_flash::Model> LoadDeepSeekModel(
     return nullptr;
   }
   std::string template_error;
-  // The API-supplied core reader is the empty view for claimed (split GSQ)
-  // artifacts; validate the template from the file itself in that case.
-  const bool template_ok =
-      (&reader == &core::GgufReader::Empty())
-          ? models::deepseek_v4_flash::ValidateTemplateFromFile(opt.model_path,
-                                                                &template_error)
-          : models::deepseek_v4_flash::ValidateGgufTemplate(reader,
-                                                            &template_error);
+  // gufo#966: core opens split/unsized containers under
+  // allow_unsized_tensors and hands the real reader to opted-in providers;
+  // the chat-template keys are ordinary metadata, so the reader path works
+  // for every artifact now. (The claim-era Empty() view is retired.)
+  const bool template_ok = models::deepseek_v4_flash::ValidateGgufTemplate(
+      reader, &template_error);
   if (!template_ok) {
     std::cerr << "Unsupported DeepSeek chat template: " << template_error
               << '\n';

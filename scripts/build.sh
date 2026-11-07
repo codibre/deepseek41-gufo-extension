@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Build Gufo with the deepseek41 (DeepSeek V4.1 Flash / Engram) extension.
 #
-# Default GUFO_REF pins gufo-org PR #966 head (TextProvider::claim_file) —
-# the hook the extension needs until that lands on main. Repin to main once
-# merged. See gufo-org/gufo issue #997 for the tracking thread.
+# Default GUFO_REF pins gufo-org PR #966 head (unsized GGUF tensor support:
+# GgufOpenOptions::allow_unsized_tensors + TextProvider::accepts_unsized_
+# tensors). The earlier claim_file hook at this PR was retired by the
+# maintainer rework; repin to main once merged. See gufo-org/gufo issue #997.
 set -euo pipefail
 
 GUFO_REPO=${GUFO_REPO:-https://github.com/gufo-org/gufo.git}
+# Pull refs only exist on the base repo (not forks); #966 head is ac631153.
 GUFO_REF=${GUFO_REF:-refs/pull/966/head}
 GUFO_DIR=${GUFO_DIR:-"$(cd "$(dirname "$0")/.." && pwd)/build-gufo"}
 EXT_DIR=$(cd "$(dirname "$0")/.." && pwd)

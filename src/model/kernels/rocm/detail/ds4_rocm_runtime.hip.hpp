@@ -1027,6 +1027,35 @@ extern "C" uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
     return tensor ? tensor->bytes : 0;
 }
 
+/* Continuation-tensor accessor for the component-cache adapter (gufo#1026
+ * plumbing): the cache exports device pointers; the engine keeps ownership
+ * of every allocation. */
+extern "C" void *ds4_gpu_tensor_device_pointer(const ds4_gpu_tensor *tensor) {
+    return tensor ? tensor->ptr : nullptr;
+}
+
+/* The F16 weight-copy path (in-tree hipBLAS prefill optimization) is not
+ * referenced by this fork's matmul dispatch. The merged engine files still
+ * call these entry points at open time, so acknowledge them without
+ * building copies: no copy is ever registered, pointer lookups miss, and
+ * every matmul stays on the quantized kernels this fork has always used.
+ * (model_data.cpp keeps the F16 rows inside the normal preload spans.) */
+extern "C" int ds4_gpu_register_q8_f16_weights(const void * /*model_map*/,
+                                               uint64_t /*model_size*/,
+                                               const ds4_gpu_q8_f16_weight * /*weights*/,
+                                               uint32_t /*count*/) {
+    return 1;
+}
+
+extern "C" int ds4_gpu_cache_model_f16_rows(const void * /*model_map*/,
+                                            uint64_t /*model_size*/,
+                                            uint64_t /*offset*/,
+                                            uint64_t /*in_dim*/,
+                                            uint64_t /*out_dim*/,
+                                            const char * /*label*/) {
+    return 1;
+}
+
 __global__ static void hc_pre_onehot_kernel(float *dst, uint32_t n_rows) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n_rows * 4u) dst[i] = (i % 4u) == 0u ? 1.0f : 0.0f;

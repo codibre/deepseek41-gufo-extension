@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "deepseek41",
   "version": "0.1.0",
-  "api_version": ">= 0.1.16",
+  "api_version": ">= 0.2.10",
   "entry": "deepseek41_register",
   "registration_target": "gufo_deepseek41",
   "depends": [],
