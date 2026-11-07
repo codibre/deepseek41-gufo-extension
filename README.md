@@ -1,3 +1,4 @@
+# WIP: this extension is NOT ready YET. We're working on it and hope we'll make it through soon!
 # deepseek41-gufo-extension
 
 Out-of-tree [gufo](https://github.com/gufo-org/gufo) model extension for
