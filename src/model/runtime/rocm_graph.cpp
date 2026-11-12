@@ -1192,6 +1192,16 @@ static bool ds4_no_comp_attn_env(void) {
   return on == 1;
 }
 
+/* A/B gate for the V4.1 sparse-prefill source-sharing selection (f9b6f03).
+ * GUFO_DS4_PF_SEL=0 skips the prefill indexer publisher and the reader
+ * match, so the batched prefill FA falls back to dense compressed attention
+ * over all owner rows (pre-selection behavior).  Default: enabled. */
+static bool ds4_pf_sel_env(void) {
+  static const bool off = getenv("GUFO_DS4_PF_SEL") &&
+                          atoi(getenv("GUFO_DS4_PF_SEL")) == 0;
+  return !off;
+}
+
 static uint32_t rocm_graph_raw_start_for_span(
         const ds4_gpu_graph *g,
         uint32_t               last_pos,
@@ -4167,7 +4177,7 @@ static bool rocm_graph_encode_layer_attention_batch(
          * publisher, exactly like the decode two-level selection.
          * ---------------------------------------------------------------- */
         bool pf_sel = false;
-        if (ok && pf_v41 && ds4_layer_is_topk_source(il)) {
+        if (ok && pf_v41 && ds4_pf_sel_env() && ds4_layer_is_topk_source(il)) {
             const uint32_t pf_idx_kv = ds4_layer_kv_source(il);
             const uint32_t pf_n_idx = g->layer_n_index_comp[pf_idx_kv];
             g->pf_sel_owner = UINT32_MAX;
@@ -4246,7 +4256,8 @@ static bool rocm_graph_encode_layer_attention_batch(
                 }
             }
         }
-        if (ok && pf_v41 && !ds4_layer_is_topk_source(il) &&
+        if (ok && pf_v41 && ds4_pf_sel_env() &&
+            !ds4_layer_is_topk_source(il) &&
             g->pf_sel_owner != UINT32_MAX &&
             g->pf_sel_owner == ds4_layer_kv_source(il))
             pf_sel = true;
