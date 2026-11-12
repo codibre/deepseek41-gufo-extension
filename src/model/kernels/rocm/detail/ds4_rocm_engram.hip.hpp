@@ -85,7 +85,7 @@ __global__ void ds4_engram_gate_kernel(float *__restrict__ hc,
     const float *val = k + (uint64_t)hc_mult * n_embd;
     const uint32_t tid = threadIdx.x;
     constexpr uint32_t NT = 256u;
-    __shared__ float s1[4], s2[4], s3[4], sg[4];
+    __shared__ float sg[4];
 
     float a1[4] = {0, 0, 0, 0}, a2[4] = {0, 0, 0, 0}, a3[4] = {0, 0, 0, 0};
     for (uint32_t d = tid; d < n_embd; d += NT) {
@@ -97,6 +97,11 @@ __global__ void ds4_engram_gate_kernel(float *__restrict__ hc,
             a3[h] += xv * kvv * egate[(uint64_t)h * n_embd + d];
         }
     }
+    // Warp-reduce each h, keep per-warp lane-0 partials in shared memory, then
+    // sum the 8 warp partials per h and broadcast the final gate to the block.
+    constexpr uint32_t NW = NT / 32u;
+    __shared__ float w1[NW][4], w2[NW][4], w3[NW][4];
+    const uint32_t wid = tid >> 5u;
 #pragma unroll
     for (uint32_t h = 0; h < 4; ++h) {
 #pragma unroll
@@ -106,18 +111,25 @@ __global__ void ds4_engram_gate_kernel(float *__restrict__ hc,
             a3[h] += __shfl_down_sync(static_cast<MASK_T>(~MASK_T(0)), a3[h], off);
         }
         if ((tid & 31u) == 0u) {
-            s1[h] = a1[h];
-            s2[h] = a2[h];
-            s3[h] = a3[h];
+            w1[wid][h] = a1[h];
+            w2[wid][h] = a2[h];
+            w3[wid][h] = a3[h];
         }
     }
     __syncthreads();
     if (tid == 0u) {
         const float inv = 1.0f / sqrtf((float)n_embd);
         for (uint32_t h = 0; h < hc_mult; ++h) {
-            const float rs1 = rsqrtf(s1[h] * inv * inv + eps);
-            const float rs2 = rsqrtf(s2[h] * inv * inv + eps);
-            const float dot = s3[h] * rs1 * rs2 * inv;
+            float t1 = 0.f, t2 = 0.f, t3 = 0.f;
+#pragma unroll
+            for (uint32_t w = 0; w < NW; ++w) {
+                t1 += w1[w][h];
+                t2 += w2[w][h];
+                t3 += w3[w][h];
+            }
+            const float rs1 = rsqrtf(t1 * inv * inv + eps);
+            const float rs2 = rsqrtf(t2 * inv * inv + eps);
+            const float dot = t3 * rs1 * rs2 * inv;
             const float mag = sqrtf(fmaxf(fabsf(dot), 1e-6f));
             sg[h] = 1.0f / (1.0f + expf(-copysignf(mag, dot)));
         }
