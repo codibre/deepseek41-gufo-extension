@@ -1574,9 +1574,9 @@ static void rocm_engram_hash_rows(const std::vector<int32_t> &hist,
       blocked = blocked || c == (int32_t)DS4_PLE_DEAD;
       toks[s] = (uint64_t)(uint32_t)(blocked ? p.pad_class : c);
     }
-    uint64_t rolling = toks[0] * p.multipliers[e * 8u + 0u];
+    uint64_t rolling = toks[0] * p.multipliers[e * p.ngram + 0u];
     for (uint32_t o = 1; o < ng && o < 8u; ++o) {
-      rolling ^= toks[o] * p.multipliers[e * 8u + o];
+      rolling ^= toks[o] * p.multipliers[e * p.ngram + o];
       for (uint32_t h = 0; h < p.heads_per_ngram; ++h) {
         const uint32_t col = (o - 1u) * p.heads_per_ngram + h;
         if (col >= cols)
@@ -1652,6 +1652,9 @@ static bool rocm_graph_engram_prepare(ds4_gpu_graph *g, const void *map,
   for (uint32_t e = 0; e < g_ds4_ple.n_modules && e < DS4_PLE_MAX_LAYERS; ++e) {
     if (!g->engram_ids[e])
       continue;
+    const char *only = getenv("DS4_ENGRAM_ONLY_MOD");
+    if (only && (int)e != atoi(only))
+      continue;
     std::vector<int32_t> ids;
     rocm_engram_hash_rows(g->token_hist, pos, n, e, ids);
     const int64_t table_rows = (int64_t)(g_ds4_engram_table_bytes / 144u);
@@ -1683,6 +1686,22 @@ static bool rocm_graph_engram_prepare(ds4_gpu_graph *g, const void *map,
 }
 
 // Gather + project + gate for the Engram module owned by layer `il`.
+/* Dump an entire tensor to file for layer-0 golden HC comparison. */
+static void ds4_dbg_dump(const ds4_gpu_tensor *t, const char *path,
+                         uint64_t count) {
+  if (!getenv("DS4_GOLDEN0") || !t) return;
+  ds4_gpu_synchronize();
+  std::vector<float> buf(count);
+  if (!ds4_gpu_tensor_read(t, 0, buf.data(), count * sizeof(float))) {
+    fprintf(stderr, "ds4: g0 dump fail %s\n", path);
+    return;
+  }
+  FILE *fp = fopen(path, "wb");
+  if (!fp) return;
+  fwrite(buf.data(), 4, count, fp);
+  fclose(fp);
+}
+
 static bool rocm_graph_engram_at_layer(ds4_gpu_graph *g, const ds4_model *model,
                                        const ds4_layer_weights *layer,
                                        uint32_t il, ds4_gpu_tensor *hc,
@@ -1690,6 +1709,11 @@ static bool rocm_graph_engram_at_layer(ds4_gpu_graph *g, const ds4_model *model,
   if (!g_ds4_ple.present)
     return true;
   const int e = ds4_ple_module_for_layer(il);
+  {
+    const char *only = getenv("DS4_ENGRAM_ONLY_MOD");
+    if (only && e >= 0 && e != atoi(only))
+      return true;
+  }
   if (e < 0 || !g->engram_rows[e] || !g->engram_kv[e] || nt == 0 ||
       nt > g->prefill_cap)
     return e < 0;
@@ -1734,15 +1758,43 @@ static bool rocm_graph_engram_at_layer(ds4_gpu_graph *g, const ds4_model *model,
     return false;
   }
   // Rows were host-gathered by rocm_graph_engram_prepare for this step.
+  static uint64_t g_eg_dumped = 0;  // bitmask: capture only the first (prefill) call per layer
+  const bool eg_dump = getenv("DS4_ENGRAM_DEBUG") && il < 64 &&
+                       !((g_eg_dumped >> il) & 1u);
+  if (eg_dump)
+    g_eg_dumped |= 1ull << il;
+  if (eg_dump) {
+    char nm[128];
+    snprintf(nm, sizeof nm, "/tmp/eg_rows_L%u.bin", il);
+    ds4_dbg_dump(v_rows, nm, (uint64_t)nt * in_dim);
+    snprintf(nm, sizeof nm, "/tmp/eg_pre_L%u.bin", il);
+    ds4_dbg_dump(hc, nm, (uint64_t)nt * (uint64_t)DS4_N_HC * DS4_N_EMBD);
+    snprintf(nm, sizeof nm, "/tmp/eg_gatew_L%u.bin", il);
+    FILE *fp = fopen(nm, "wb");
+    if (fp) {
+      fwrite(gate_p, 4, (size_t)DS4_N_HC * DS4_N_EMBD, fp);
+      fclose(fp);
+    }
+  }
   if (!no_kv)
     ok = ds4_gpu_engram_kv(v_rows, kv_p, v_kv, nt, out_dim,
                            in_dim, in_dim / 256u) != 0 &&
          ds4_gpu_probe_sync("engram kv") != 0;
+  if (eg_dump && !no_kv) {
+    char nm[128];
+    snprintf(nm, sizeof nm, "/tmp/eg_kv_L%u.bin", il);
+    ds4_dbg_dump(v_kv, nm, (uint64_t)nt * out_dim);
+  }
   if (ok && !no_gate)
     ok = ds4_gpu_engram_gate(hc, v_kv, gate_p, nt, DS4_N_EMBD,
                              DS4_N_HC, (uint64_t)DS4_N_HC * DS4_N_EMBD,
                              out_dim, DS4_RMS_EPS) != 0 &&
          ds4_gpu_probe_sync("engram gate") != 0;
+  if (eg_dump) {
+    char nm[128];
+    snprintf(nm, sizeof nm, "/tmp/eg_post_L%u.bin", il);
+    ds4_dbg_dump(hc, nm, (uint64_t)nt * (uint64_t)DS4_N_HC * DS4_N_EMBD);
+  }
   ds4_gpu_tensor_free(v_rows);
   ds4_gpu_tensor_free(v_kv);
   return ok;
@@ -1764,21 +1816,6 @@ static void ds4_dbg_vals(const ds4_gpu_tensor *t, const char *tag,
   fprintf(stderr, "\n");
 }
 
-/* Dump an entire tensor to file for layer-0 golden HC comparison. */
-static void ds4_dbg_dump(const ds4_gpu_tensor *t, const char *path,
-                         uint64_t count) {
-  if (!getenv("DS4_GOLDEN0") || !t) return;
-  ds4_gpu_synchronize();
-  std::vector<float> buf(count);
-  if (!ds4_gpu_tensor_read(t, 0, buf.data(), count * sizeof(float))) {
-    fprintf(stderr, "ds4: g0 dump fail %s\n", path);
-    return;
-  }
-  FILE *fp = fopen(path, "wb");
-  if (!fp) return;
-  fwrite(buf.data(), 4, count, fp);
-  fclose(fp);
-}
 
 /* DS4_RMS_PROBE=1: per-layer row statistics to bisect where the residual
  * stream diverges. Appends rms/min/max/argmax lines to /tmp/ds4_rms.log. */
@@ -5116,7 +5153,8 @@ static bool rocm_graph_encode_layer_attention_batch(
        * tensor and dump in/out + the byte-exact registered weight image, so
        * the host can separate a wrong weight slice from a wrong contraction.
        * x[t,g,d] = ((d*13 + t*7 + g) % 29 - 14) * 0.25 */
-      if (ok && getenv("DS4_H_DUMP") && getenv("DS4_GOLDEN0") && il == 0u &&
+      if (ok && getenv("DS4_H_DUMP") && getenv("DS4_GOLDEN0") &&
+        getenv("GUFO_DS4_WOAP") && il == 0u &&
           !g_woa_probe_done) {
           g_woa_probe_done = true;
           const uint32_t pw_toks = 4u, pw_groups = n_groups;

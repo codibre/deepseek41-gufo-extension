@@ -2,3 +2,4 @@ build-gufo/
 build/
 __pycache__/
 *.o
+.host-old/

@@ -1852,6 +1852,39 @@ static void validate_ple_metadata(const ds4_model *m) {
             ple.dead_token_id = ple.token_map[(size_t)pad_tok];
         }
     }
+    if (getenv("DS4_ENGRAM_DEBUG")) {
+        FILE *fp = fopen("/tmp/ple_meta.json", "wb");
+        if (fp) {
+            fprintf(fp, "{\n\"layers\":[");
+            for (uint32_t i = 0; i < n_modules; i++)
+                fprintf(fp, "%llu%s", (unsigned long long)ple.layers[i],
+                        i + 1 < n_modules ? "," : "");
+            fprintf(fp, "],\n\"ngram\":%u,\n\"heads\":%u,\n\"cols_per_module\":%u,\n"
+                        "\"multipliers\":[", ple.ngram, ple.heads_per_ngram,
+                    ple.cols_per_module);
+            for (uint32_t i = 0; i < n_modules * ngram; i++)
+                fprintf(fp, "%llu%s", (unsigned long long)ple.multipliers[i],
+                        i + 1 < n_modules * ngram ? "," : "");
+            fprintf(fp, "],\n\"offsets\":[");
+            for (uint32_t i = 0; i < ple.total_cols; i++)
+                fprintf(fp, "%llu%s", (unsigned long long)ple.offsets[i],
+                        i + 1 < ple.total_cols ? "," : "");
+            fprintf(fp, "],\n\"primes\":[");
+            for (uint32_t i = 0; i < ple.total_cols; i++)
+                fprintf(fp, "%u%s", ple.primes[i],
+                        i + 1 < ple.total_cols ? "," : "");
+            fprintf(fp, "],\n\"pad_class\":%lld,\n\"dead\":%lld,\n\"vocab_map\":%zu,\n"
+                        "\"token_map\":[",
+                    (long long)ple.pad_class, (long long)ple.dead_token_id,
+                    ple.token_map.size());
+            for (size_t i = 0; i < ple.token_map.size(); i++)
+                fprintf(fp, "%d%c", ple.token_map[i],
+                        i + 1 < ple.token_map.size() ? ',' : ']');
+            fprintf(fp, "}\n");
+            fclose(fp);
+            fprintf(stderr, "ds4: PLE meta dumped to /tmp/ple_meta.json\n");
+        }
+    }
     g_ds4_ple = ple;
 }
 
