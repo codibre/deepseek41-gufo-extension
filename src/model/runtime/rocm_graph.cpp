@@ -27,6 +27,7 @@
 #define DS4_SPEC_PREFIX_SLOTS 4u
 
 static bool g_rope_probe_done = false;
+static bool g_woa_probe_done = false;
 
 static float layer_rope_freq_base(uint32_t layer) {
     return ds4_layer_compress_ratio(layer) != 0 && DS4_COMPRESS_ROPE_FREQ_BASE > 0.0f
@@ -5108,7 +5109,71 @@ static bool rocm_graph_encode_layer_attention_batch(
               FILE *wf = fopen("/tmp/hb_wa_L00.bin", "wb");
               if (wf) { fwrite(wa_dbg, 1, 32768u, wf); fclose(wf); }
           } else {
-              fprintf(stderr, "ds4-dbg: wo_a runtime range lookup FAILED\n");
+              fprintf(stderr, "ds4: wo_a runtime range lookup FAILED\n");
+          }
+      }
+      /* Micro-probe: drive the real output_a kernel with a synthetic heads
+       * tensor and dump in/out + the byte-exact registered weight image, so
+       * the host can separate a wrong weight slice from a wrong contraction.
+       * x[t,g,d] = ((d*13 + t*7 + g) % 29 - 14) * 0.25 */
+      if (ok && getenv("DS4_H_DUMP") && getenv("DS4_GOLDEN0") && il == 0u &&
+          !g_woa_probe_done) {
+          g_woa_probe_done = true;
+          const uint32_t pw_toks = 4u, pw_groups = n_groups;
+          const uint32_t pw_gdim = (uint32_t)group_dim;
+          const uint32_t pw_rank = (uint32_t)rank;
+          ds4_gpu_tensor *ph = ds4_gpu_tensor_alloc_managed(
+              (uint64_t)pw_toks * pw_groups * pw_gdim * 4u);
+          ds4_gpu_tensor *pl = ds4_gpu_tensor_alloc_managed(
+              (uint64_t)pw_toks * pw_groups * pw_rank * 4u);
+          if (ph && pl &&
+              ds4_gpu_attention_output_a_q5_k_tensor(
+                  pl, model->map, model->size,
+                  layer->attn_output_a->abs_offset, group_dim, rank, n_groups,
+                  ph, pw_toks)) {
+              ds4_gpu_synchronize();
+              float *hp = (float *)ds4_gpu_tensor_device_pointer(ph);
+              for (uint32_t t = 0; t < pw_toks; ++t)
+                  for (uint32_t g = 0; g < pw_groups; ++g) {
+                      float *row = hp + ((uint64_t)t * pw_groups + g) * pw_gdim;
+                      for (uint32_t d = 0; d < pw_gdim; ++d)
+                          row[d] =
+                              (float)(((int)(d * 13u + t * 7u + g) % 29) - 14) *
+                              0.25f;
+                  }
+              ds4_gpu_attention_output_a_q5_k_tensor(
+                  pl, model->map, model->size,
+                  layer->attn_output_a->abs_offset, group_dim, rank, n_groups,
+                  ph, pw_toks);
+              ds4_gpu_synchronize();
+              FILE *pf = fopen("/tmp/gw_heads.bin", "wb");
+              if (pf) {
+                  fwrite(hp, 4u, (size_t)pw_toks * pw_groups * pw_gdim, pf);
+                  fclose(pf);
+              }
+              const float *lp = (const float *)ds4_gpu_tensor_device_pointer(pl);
+              pf = fopen("/tmp/gw_low.bin", "wb");
+              if (pf) {
+                  fwrite(lp, 4u, (size_t)pw_toks * pw_groups * pw_rank, pf);
+                  fclose(pf);
+              }
+              const uint64_t wbytes = (uint64_t)pw_groups * pw_rank *
+                                      (pw_gdim / 256ull) * 176ull;
+              const char *wimg = (const char *)ds4_gpu_model_range_ptr(
+                  model->map, layer->attn_output_a->abs_offset, wbytes,
+                  "dbg_output_a_probe");
+              if (wimg) {
+                  pf = fopen("/tmp/gw_map.bin", "wb");
+                  if (pf) {
+                      fwrite(wimg, 1, (size_t)wbytes, pf);
+                      fclose(pf);
+                  }
+              } else {
+                  fprintf(stderr, "ds4: wo_a probe range lookup FAILED\n");
+              }
+              fprintf(stderr, "ds4: wo_a micro-probe written (toks=%u rank=%u "
+                              "groups=%u gdim=%u)\n",
+                      pw_toks, pw_rank, pw_groups, pw_gdim);
           }
       }
       /* V4.1: grouped Q5_K wo_a (concat per group, no sum) + Q5_K wo_b. */
