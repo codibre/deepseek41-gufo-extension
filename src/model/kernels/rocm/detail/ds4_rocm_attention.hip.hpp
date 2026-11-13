@@ -16,6 +16,28 @@
 #define DS4_ROCM_ATTENTION_INDEXED_SCORE_CAP \
     (256u + DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP)
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+/* DS4 attention memory split: raw rows serve the sliding window [win_start,
+ * qpos]; compressed groups serve the older prefix only.  A group whose tokens
+ * are already inside the window must NOT be attended as well, else those
+ * tokens are double-counted in the softmax — visible to short prompts already
+ * (golden L1 mismatch 0.797 corr at 5 tokens).  Largest group index fully
+ * ending before win_start: ci * ratio + ratio - 1 < win_start. */
+__device__ __forceinline__ uint32_t ds4_comp_visible_limit(
+        uint32_t qpos, uint32_t window, uint32_t ratio, uint32_t first_raw_pos) {
+    if (ratio == 0u || window == 0u) return 0xffffffffu;
+    /* Compressed rows stand in only for tokens the raw cache no longer
+     * carries.  Raw rows cover [max(wstart, first_raw_pos), qpos]: wstart is
+     * the sliding-window boundary and first_raw_pos where the resident raw
+     * span begins.  Groups fully below that bound are visible; groups whose
+     * tokens are still resident must NOT be attended as well -- double
+     * counting diluted every head toward the sequence mean (root cause of
+     * the length-decay collapse). */
+    const uint32_t wstart = (qpos + 1u > window) ? (qpos + 1u - window) : 0u;
+    const uint32_t raw_floor =
+        first_raw_pos > wstart ? first_raw_pos : wstart;
+    return raw_floor / ratio;
+}
+
 template <bool INDEXED, bool COMP_F16>
 __global__ __launch_bounds__(1024, 1) static void attention_mixed_heads32_wmma_kernel(
         float *heads,
@@ -97,6 +119,10 @@ __global__ __launch_bounds__(1024, 1) static void attention_mixed_heads32_wmma_k
     if (ratio != 0u) {
         visible_comp = (qpos + 1u) / ratio;
         if (visible_comp > n_comp) visible_comp = n_comp;
+    }
+    if (window != 0u && ratio != 0u) {
+        const uint32_t vlim = ds4_comp_visible_limit(qpos, window, ratio, first_raw_pos);
+        if (visible_comp > vlim) visible_comp = vlim;
     }
     /* Row-table setup, off the single-thread path.
      *
@@ -445,6 +471,10 @@ __global__ static void attention_prefill_mixed_kernel(
     uint32_t raw_count = t + 1u - raw_start;
     uint32_t visible_comp = (t + 1u) / ratio;
     if (visible_comp > n_comp) visible_comp = n_comp;
+    if (window != 0u && ratio != 0u) {
+        const uint32_t vlim = ds4_comp_visible_limit(t, window, ratio, 0u);
+        if (visible_comp > vlim) visible_comp = vlim;
+    }
     __shared__ float scores[DS4_ROCM_ATTENTION_PREFILL_MIXED_SCORE_CAP];
     __shared__ float partial[256];
     __shared__ float max_s;
@@ -566,7 +596,9 @@ __global__ static void attention_prefill_mixed_softmax_kernel(
     __shared__ float max_s;
     __shared__ float denom;
     float local_max = sinks[h];
-    const uint32_t visible_comp = (t + 1u) / ratio;
+    const uint32_t visible_comp = (window != 0u && ratio != 0u)
+        ? ((t + 1u > window ? t + 1u - window : 0u) / ratio)
+        : ((t + 1u) / ratio);
     for (uint32_t k = threadIdx.x; k < n_keys; k += blockDim.x) {
         float s = -INFINITY;
         if (k < n_tokens) {
@@ -627,7 +659,9 @@ __global__ static void attention_prefill_mixed_softmax_tile_kernel(
     __shared__ float max_s;
     __shared__ float denom;
     float local_max = sinks[h];
-    const uint32_t visible_comp = (global_t + 1u) / ratio;
+    const uint32_t visible_comp = (window != 0u && ratio != 0u)
+        ? ((global_t + 1u > window ? global_t + 1u - window : 0u) / ratio)
+        : ((global_t + 1u) / ratio);
     for (uint32_t k = threadIdx.x; k < n_keys; k += blockDim.x) {
         float s = -INFINITY;
         if (k < raw_tokens) {
@@ -1124,6 +1158,10 @@ __global__ static void attention_indexed_mixed_kernel(
         visible_comp = (qpos + 1u) / ratio;
         if (visible_comp > n_comp) visible_comp = n_comp;
     }
+    if (window != 0u && ratio != 0u) {
+        const uint32_t vlim = ds4_comp_visible_limit(qpos, window, ratio, first_raw_pos);
+        if (visible_comp > vlim) visible_comp = vlim;
+    }
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
     __shared__ float scores[DS4_ROCM_ATTENTION_INDEXED_SCORE_CAP];
     __shared__ uint32_t raw_rows[256];
@@ -1294,6 +1332,10 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
         visible_comp = (qpos + 1u) / ratio;
         if (visible_comp > n_comp) visible_comp = n_comp;
     }
+    if (window != 0u && ratio != 0u) {
+        const uint32_t vlim = ds4_comp_visible_limit(qpos, window, ratio, first_raw_pos);
+        if (visible_comp > vlim) visible_comp = vlim;
+    }
 
     if (threadIdx.x == 0) {
         raw_count = 0;
@@ -1416,6 +1458,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     }
 }
 
+
 __global__ static void attention_static_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
@@ -1442,7 +1485,12 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
     const uint32_t raw_start = t + 1u - raw_count;
     uint32_t comp_count = 0;
     if (n_comp != 0u && ratio != 0u) {
-        comp_count = (t + 1u) / ratio;
+        /* Compressed rows cover [0, raw_start); raw rows cover
+         * [raw_start, t]. The old `(t + 1u) / ratio` double-counted every
+         * group whose tokens were still in the raw window, diluting every
+         * head toward the sequence mean and collapsing prompts as soon as
+         * the comp mass dominated the softmax. */
+        comp_count = raw_start / ratio;
         if (comp_count > n_comp) comp_count = n_comp;
     }
     const uint32_t n_score = raw_count + comp_count;
@@ -1576,7 +1624,17 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         if (n_tokens == 1u && ratio == 0u) {
             comp_count = n_comp;
         } else if (ratio != 0u) {
-            comp_count = (qpos + 1u) / ratio;
+            /* A compressed group may only be attended once every token it
+             * pools has left the raw window: group g covers [4g, 4g+3], so
+             * visibility is bounded by first_raw_pos, NOT by qpos.  Using
+             * (qpos + 1) / ratio double-counts the whole in-window prefix
+             * (the raw rows already cover those tokens), which diluted the
+             * softmax and produced long-prompt collapse. */
+            const uint32_t first_possible =
+                n_raw >= window ? (n_raw - window) : 0u;
+            const uint32_t raw_floor =
+                first_raw_pos > first_possible ? first_raw_pos : first_possible;
+            comp_count = raw_floor / ratio;
             if (comp_count > n_comp) comp_count = n_comp;
         }
     }

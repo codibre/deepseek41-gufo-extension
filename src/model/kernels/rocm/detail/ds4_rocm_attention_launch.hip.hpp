@@ -29,6 +29,11 @@ extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, cons
       head_dim);
   return hip_ok(hipGetLastError(), "store_raw_kv_batch launch");
 }
+/* Route tracing for the mixed-attention launcher (DS4_LTRACE=1). */
+static inline int ds4_ltrace_on() {
+    static const int v = getenv("DS4_LTRACE") != NULL;
+    return v;
+}
 // Score scratch for the single-token decode attention launches. Rounding to
 // whole MiB keeps the shared buffer from regrowing as the context lengthens.
 static float *attention_decode_scores_alloc(uint32_t n_head, uint32_t n_raw,
@@ -101,6 +106,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
   if (n_tokens > 1 && head_dim == 512 &&
       ((window != 0u ? window : n_tokens) <= 768u)) {
     dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
+    if (ds4_ltrace_on()) fprintf(stderr, "ds4: [ltrace] static8 L104 nt=%u\n", n_tokens);
     attention_static_mixed_heads8_online_kernel<<<grid, 256>>>(
         (float*)heads->ptr, sinks, (const float*)q->ptr,
         (const float*)raw_kv->ptr, (const float*)raw_kv->ptr, n_tokens, 0,
@@ -249,6 +255,7 @@ static int attention_decode_batch_launch(
     if (!hip_attention_score_buffer_fits(n_comp)) {
         if (!use_comp_mask && head_dim == 512u) {
             dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
+            if (ds4_ltrace_on()) fprintf(stderr, "ds4: [ltrace] decode8 L253 nt=%u nc=%u\n", n_tokens, n_comp);
             attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
                                                                               sinks,
                                                                               (const float *)q->ptr,
@@ -287,6 +294,7 @@ static int attention_decode_batch_launch(
         n_head == 64u && head_dim == 512u && window != 0u && window <= 256u &&
         ratio != 0u) {
       const dim3 grid(n_tokens, n_head / 32u, 1u);
+      if (ds4_ltrace_on()) fprintf(stderr, "ds4: [ltrace] wmma L292 nt=%u nc=%u\n", n_tokens, n_comp);
       attention_mixed_heads32_wmma_kernel<false, false><<<grid, 1024>>>(
           (float*)heads->ptr, sinks, (const float*)q->ptr,
           (const float*)raw_kv->ptr, (const float*)comp_kv->ptr, NULL, NULL, 0u,
@@ -308,6 +316,7 @@ static int attention_decode_batch_launch(
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         fast_window_attention) {
       dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
+      if (ds4_ltrace_on()) fprintf(stderr, "ds4: [ltrace] decode8 L314 nt=%u nc=%u\n", n_tokens, n_comp);
       attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>(
           (float*)heads->ptr, sinks, (const float*)q->ptr,
           (const float*)raw_kv->ptr,
@@ -765,6 +774,7 @@ static int attention_prefill_mixed_launch(
         n_tokens >= DS4_ROCM_ATTENTION_WIDE_ROWS && n_comp != 0u &&
         n_head == 64u && head_dim == 512u && window != 0u && window <= 256u) {
       const dim3 grid(n_tokens, n_head / 32u, 1u);
+      if (ds4_ltrace_on()) fprintf(stderr, "ds4: [ltrace] wmma L772 nt=%u nc=%u\n", n_tokens, n_comp);
       attention_mixed_heads32_wmma_kernel<false, false><<<grid, 1024>>>(
           (float*)heads->ptr, sinks, (const float*)q->ptr,
           (const float*)raw_kv->ptr, (const float*)comp_kv->ptr, NULL, NULL, 0u,
@@ -784,6 +794,7 @@ static int attention_prefill_mixed_launch(
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         ((window != 0u ? window : n_tokens) + n_comp <= 768u)) {
       dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
+      if (ds4_ltrace_on()) fprintf(stderr, "ds4: [ltrace] static8 L792 nt=%u nc=%u\n", n_tokens, n_comp);
       attention_static_mixed_heads8_online_kernel<<<grid, 256>>>(
           (float*)heads->ptr, sinks, (const float*)q->ptr,
           (const float*)raw_kv->ptr,
