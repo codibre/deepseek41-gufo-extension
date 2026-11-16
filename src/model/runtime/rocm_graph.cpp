@@ -4885,6 +4885,29 @@ static bool rocm_graph_encode_layer_attention_batch(
             if (ok) batch_attention_done = true;
         }
         if (ok && zero_prefix && !topk_prefill_needed && n_comp != 0) {
+            if (getenv("DS4_H_DUMP")) {
+                const uint32_t c_f16 = rocm_graph_attn_comp_cache_is_f16() ? 2u : 4u;
+                ds4_gpu_tensor *cv = ds4_gpu_tensor_view(
+                    g->layer_attn_comp_cache[il], 0,
+                    (uint64_t)n_comp * DS4_N_HEAD_DIM * c_f16);
+                if (cv) { char fn[80]; snprintf(fn, sizeof fn, "/tmp/hb_all_cc_%02u.bin", il);
+                          ds4_dbg_dump(cv, fn, (uint32_t)((uint64_t)n_comp * DS4_N_HEAD_DIM * c_f16 / 4u)); }
+                if (cv) ds4_gpu_tensor_free(cv);
+                if (il == 20u) {
+                { ds4_gpu_tensor *qv = ds4_gpu_tensor_view(
+                      g->batch_q, 0, (uint64_t)n_tokens * DS4_N_HEAD * DS4_N_HEAD_DIM * 4u);
+                  if (qv) ds4_dbg_dump(qv, (char *)"/tmp/hb_all_qr.bin",
+                                       (uint32_t)((uint64_t)n_tokens * DS4_N_HEAD * DS4_N_HEAD_DIM));
+                  if (qv) ds4_gpu_tensor_free(qv); }
+                { ds4_gpu_tensor *kv = ds4_gpu_tensor_view(
+                      g->batch_kv, 0, (uint64_t)n_tokens * DS4_N_HEAD_DIM * 4u);
+                  if (kv) ds4_dbg_dump(kv, (char *)"/tmp/hb_all_kv.bin",
+                                       (uint32_t)((uint64_t)n_tokens * DS4_N_HEAD_DIM));
+                  if (kv) ds4_gpu_tensor_free(kv); }
+                }
+                fprintf(stderr, "ds4: [hdump] static-mixed L%02u nt=%u n_comp=%u ratio=%u win=%u f16=%u\n",
+                        il, n_tokens, n_comp, ratio, g->raw_window, c_f16);
+            }
             ok = ds4_gpu_attention_prefill_static_mixed_heads_tensor(g->batch_heads,
                                                                        model->map,
                                                                        model->size,
@@ -4899,6 +4922,13 @@ static bool rocm_graph_encode_layer_attention_batch(
                                                                        ratio,
                                                                        DS4_N_HEAD,
                                                                        DS4_N_HEAD_DIM) != 0;
+            if (ok && getenv("DS4_H_DUMP")) {
+                ds4_gpu_tensor *hv = ds4_gpu_tensor_view(
+                    g->batch_heads, 0, (uint64_t)n_tokens * DS4_N_HEAD * DS4_N_HEAD_DIM * 4u);
+                if (hv) { char fn[80]; snprintf(fn, sizeof fn, "/tmp/hb_all_ho_%02u.bin", il);
+                          ds4_dbg_dump(hv, fn, (uint32_t)((uint64_t)n_tokens * DS4_N_HEAD * DS4_N_HEAD_DIM)); }
+                if (hv) ds4_gpu_tensor_free(hv);
+            }
             if (ok) batch_attention_done = true;
         }
     }
