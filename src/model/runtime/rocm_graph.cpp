@@ -5226,6 +5226,14 @@ static bool rocm_graph_encode_layer_attention_batch(
         snprintf(hbp, sizeof hbp, "/tmp/hb_hr_L00.bin");
         if (v) ds4_dbg_dump(v, hbp, 32768u);
     }
+    if (getenv("DS4_H_DUMP") && getenv("DS4_GOLDEN0") && g->batch_heads) {
+        char hbp[80];
+        snprintf(hbp, sizeof hbp, "/tmp/hb_hd_%02u.bin", il);
+        ds4_gpu_tensor *vh = ds4_gpu_tensor_view(g->batch_heads, 0,
+            (uint64_t)n_tokens * 32768ull * 4u);
+        if (vh) { ds4_dbg_dump(vh, hbp, (uint32_t)(n_tokens * 32768ull));
+                  ds4_gpu_tensor_free(vh); }
+    }
     if (ok && !output_hc_fused && !inv_rope_fused) {
       ok = ds4_gpu_attention_output_q8_batch_tensor(
                g->batch_attn_out, g->batch_attn_low, g->batch_group_tmp,
