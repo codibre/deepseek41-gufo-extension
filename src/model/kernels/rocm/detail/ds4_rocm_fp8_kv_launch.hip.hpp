@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <cstdlib>
 
 // Diagnostic: DS4_NO_KVQUANT=1 skips the e4m3 rounding of raw-window KV rows
@@ -6,7 +7,15 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n
     if (n_rot > head_dim || !hip_tensor_has_elems2(x, n_tok, head_dim, sizeof(float))) return 0;
     if (n_tok == 0u || head_dim == 0u) return 1;
     static const int ds4_no_kvquant = getenv("DS4_NO_KVQUANT") != nullptr;
-    if (ds4_no_kvquant) return 1;
+    if (ds4_no_kvquant) {
+        static int once = 0;
+        if (!once++) fprintf(stderr, "DS4KVQ: raw-window quantize BYPASSED\n");
+        return 1;
+    }
+    {
+        static int once = 0;
+        if (!once++) fprintf(stderr, "DS4KVQ: raw-window e4m3 quantize ACTIVE (group=64)\n");
+    }
     const uint32_t n_nope = head_dim - n_rot;
     if (n_nope == 0) return 1;
     const uint32_t groups = (n_nope + 63u) / 64u;
@@ -28,6 +37,16 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_mirror_f16_tensor(
         return 0;
     }
     if (n_tok == 0u || head_dim == 0u) return 1;
+    {
+        static const int ds4_no_kvquant = getenv("DS4_NO_KVQUANT") != nullptr;
+        if (ds4_no_kvquant) {
+            static int once = 0;
+            if (!once++) fprintf(stderr, "DS4KVQ: mirror-f16 quantize BYPASSED\n");
+            return 1;
+        }
+        static int once = 0;
+        if (!once++) fprintf(stderr, "DS4KVQ: mirror-f16 e4m3 quantize ACTIVE (group=64)\n");
+    }
     const uint32_t groups = (head_dim + 63u) / 64u;
     fp8_kv_quantize_kernel<<<dim3(n_tok, groups), 64>>>(
             (float *)x->ptr,
